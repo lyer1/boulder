@@ -8,9 +8,9 @@
         <class>com.crag.entity.VpfDeclaration</class>
         <class>com.crag.entity.HrEmployee</class>
         <class>com.crag.entity.SysUser</class>
+        <class>com.crag.entity.OrgUser</class>
 
         <properties>
-            <!-- The Magic Connection -->
             <property name="jakarta.persistence.jdbc.driver" value="com.boulder.jdbc.PitonDriver"/>
             <property name="jakarta.persistence.jdbc.url" value="jdbc:boulder:jdbc:h2:mem:cragdb;DB_CLOSE_DELAY=-1"/>
             <property name="jakarta.persistence.jdbc.user" value="sa"/>
