@@ -81,6 +81,16 @@ public class ChalkBag {
         return false;
     }
 
+    public boolean hasDeletes(String table) {
+        Map<String, Map<String, Object>> tableState = state.get(table.toLowerCase());
+        if (tableState != null) {
+            for (Map.Entry<String, Map<String, Object>> entry : tableState.entrySet()) {
+                if (entry.getValue() == null) return true;
+            }
+        }
+        return false;
+    }
+
     public Map<String, Map<String, Object>> getTable(String table) {
         return state.get(table.toLowerCase());
     }

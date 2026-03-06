@@ -6,6 +6,8 @@
     <persistence-unit name="crag-pu" transaction-type="RESOURCE_LOCAL">
         <provider>org.hibernate.jpa.HibernatePersistenceProvider</provider>
         <class>com.crag.entity.VpfDeclaration</class>
+        <class>com.crag.entity.HrEmployee</class>
+        <class>com.crag.entity.SysUser</class>
 
         <properties>
             <!-- The Magic Connection -->
