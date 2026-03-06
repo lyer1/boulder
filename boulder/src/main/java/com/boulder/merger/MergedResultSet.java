@@ -83,20 +83,23 @@ public class MergedResultSet extends PitonResultSetDecorator {
     }
 
     private void resolveTables(PlainSelect ps) {
+        // LinkedHashMap keeps insertion order, ensuring primary table is first
+        Map<String, String> newAliasToTable = new java.util.LinkedHashMap<>();
         if (ps.getFromItem() instanceof Table) {
             Table t = (Table) ps.getFromItem();
             String name = t.getName().toLowerCase();
-            aliasToTable.put((t.getAlias() != null ? t.getAlias().getName().toLowerCase() : name), name);
+            newAliasToTable.put((t.getAlias() != null ? t.getAlias().getName().toLowerCase() : name), name);
         }
         if (ps.getJoins() != null) {
             for (Join j : ps.getJoins()) {
                 if (j.getRightItem() instanceof Table) {
                     Table t = (Table) j.getRightItem();
                     String name = t.getName().toLowerCase();
-                    aliasToTable.put((t.getAlias() != null ? t.getAlias().getName().toLowerCase() : name), name);
+                    newAliasToTable.put((t.getAlias() != null ? t.getAlias().getName().toLowerCase() : name), name);
                 }
             }
         }
+        this.aliasToTable = newAliasToTable;
     }
 
     private void resolveJoins(PlainSelect ps) {
@@ -204,8 +207,11 @@ public class MergedResultSet extends PitonResultSetDecorator {
                     }
                 }
                 if (patchMatches) {
-                    if (t.equalsIgnoreCase(primary)) primaryPKs.add(e.getKey());
-                    else resolvePrimaryPKsFromJoinedPK(t, e.getKey(), primary, primaryPKs);
+                    if (t.equalsIgnoreCase(primary)) {
+                        primaryPKs.add(e.getKey());
+                    } else {
+                        resolvePrimaryPKsFromJoinedPK(t, e.getKey(), primary, primaryPKs);
+                    }
                 }
             }
         }
@@ -231,7 +237,17 @@ public class MergedResultSet extends PitonResultSetDecorator {
                     try (ResultSet rs = ps.executeQuery()) {
                         while (rs.next()) res.add(rs.getString(1));
                     }
-                } catch (Exception e) {}
+                } catch (Exception e) { e.printStackTrace(); }
+            } else if (joinedT.equalsIgnoreCase(ji.leftTable) && primaryT.equalsIgnoreCase(ji.rightTable)) {
+                String pkCol = tableToPkCol.get(primaryT);
+                if (pkCol == null) pkCol = "id";
+                try (PreparedStatement ps = delegate.getStatement().getConnection().prepareStatement(
+                        "SELECT " + pkCol + " FROM " + primaryT + " WHERE " + ji.rightCol + " = ?")) {
+                    ps.setObject(1, joinedPK);
+                    try (ResultSet rs = ps.executeQuery()) {
+                        while (rs.next()) res.add(rs.getString(1));
+                    }
+                } catch (Exception e) { e.printStackTrace(); }
             }
         }
     }
@@ -256,6 +272,20 @@ public class MergedResultSet extends PitonResultSetDecorator {
                 }
             }
         }
+
+        // Also fetch columns needed by filters so matchesAllFilters doesn't fail on missing keys
+        for (String t : aliasToTable.values()) {
+            Object pkOfT = t.equalsIgnoreCase(table) ? pk : resolvePkAcrossJoin(table, pk, t);
+            if (pkOfT != null) {
+                for (String fCol : whereFilters.keySet()) {
+                    if (!row.containsKey(fCol)) {
+                        Object val = fetchPhys(t, pkOfT.toString(), fCol);
+                        if (val != null) row.put(fCol, val);
+                    }
+                }
+            }
+        }
+
         return row;
     }
 
@@ -273,7 +303,9 @@ public class MergedResultSet extends PitonResultSetDecorator {
     private boolean matchesAllFilters(Map<String, Object> row) {
         for (Map.Entry<String, Object> f : whereFilters.entrySet()) {
             Object v = row.get(f.getKey());
-            if (v == null || !v.toString().equalsIgnoreCase(f.getValue().toString())) return false;
+            if (v == null || !v.toString().equalsIgnoreCase(f.getValue().toString())) {
+                return false;
+            }
         }
         return true;
     }
@@ -331,8 +363,42 @@ public class MergedResultSet extends PitonResultSetDecorator {
     private Object resolvePkAcrossJoin(String fromT, String fromPK, String toT) {
         for (JoinInfo ji : joins) {
             if (fromT.equalsIgnoreCase(ji.leftTable) && toT.equalsIgnoreCase(ji.rightTable)) {
+                // If the from table is virtual, try ChalkBag first!
+                Map<String, Object> pRow = ChalkBag.get().getRow(fromT, fromPK);
+                if (pRow != null && pRow.containsKey(ji.leftCol)) {
+                    Object val = pRow.get(ji.leftCol);
+                    if (val != null) return val;
+                }
+
+                // Fallback: If both are virtual, we might need to search the other table
+                Map<String, Map<String, Object>> toState = ChalkBag.get().getTable(toT);
+                if (toState != null) {
+                    for (Map.Entry<String, Map<String, Object>> e : toState.entrySet()) {
+                        if (e.getValue() != null && e.getValue().containsKey(ji.rightCol)) {
+                            Object toVal = e.getValue().get(ji.rightCol);
+                            if (toVal != null && toVal.toString().equals(fromPK)) return e.getKey();
+                        }
+                    }
+                }
                 return fetchPhys(fromT, fromPK, ji.leftCol);
             } else if (fromT.equalsIgnoreCase(ji.rightTable) && toT.equalsIgnoreCase(ji.leftTable)) {
+                // If the from table is virtual, try ChalkBag first!
+                Map<String, Object> pRow = ChalkBag.get().getRow(fromT, fromPK);
+                if (pRow != null && pRow.containsKey(ji.rightCol)) {
+                    Object val = pRow.get(ji.rightCol);
+                    if (val != null) return val;
+                }
+
+                // Fallback: If both are virtual, we might need to search the other table
+                Map<String, Map<String, Object>> toState = ChalkBag.get().getTable(toT);
+                if (toState != null) {
+                    for (Map.Entry<String, Map<String, Object>> e : toState.entrySet()) {
+                        if (e.getValue() != null && e.getValue().containsKey(ji.leftCol)) {
+                            Object toVal = e.getValue().get(ji.leftCol);
+                            if (toVal != null && toVal.toString().equals(fromPK)) return e.getKey();
+                        }
+                    }
+                }
                 return fetchPhys(fromT, fromPK, ji.rightCol);
             }
         }
