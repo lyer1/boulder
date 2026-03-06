@@ -8,12 +8,24 @@ import java.sql.ResultSetMetaData;
 import java.sql.SQLException;
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
+import net.sf.jsqlparser.expression.Expression;
+import net.sf.jsqlparser.expression.LongValue;
+import net.sf.jsqlparser.expression.StringValue;
+import net.sf.jsqlparser.expression.DoubleValue;
+import net.sf.jsqlparser.expression.JdbcParameter;
+import net.sf.jsqlparser.expression.operators.relational.EqualsTo;
 import net.sf.jsqlparser.parser.CCJSqlParserUtil;
+import net.sf.jsqlparser.schema.Column;
+import net.sf.jsqlparser.schema.Table;
 import net.sf.jsqlparser.statement.Statement;
+import net.sf.jsqlparser.statement.select.FromItem;
+import net.sf.jsqlparser.statement.select.Join;
 import net.sf.jsqlparser.statement.select.PlainSelect;
 import net.sf.jsqlparser.statement.select.Select;
 import net.sf.jsqlparser.util.TablesNamesFinder;
@@ -21,100 +33,175 @@ import net.sf.jsqlparser.util.TablesNamesFinder;
 public class MergedResultSet extends PitonResultSetDecorator {
 
     private final String sql;
-    private Map<String, Integer> columnNameToIndex = new HashMap<>();
-    private Map<Integer, String> indexToColumnName = new HashMap<>();
+    private final Map<Integer, Object> statementParameters;
 
-    private String tableName;
-    private String pkColumnName = "id";
+    // Table Meta Info
+    private Map<String, String> aliasToTableName = new HashMap<>();
+    private Map<String, Integer> tablePkColumnIndex = new HashMap<>();
+    
+    // Column Index Mappings
+    private Map<String, Integer> columnLabelToIndex = new HashMap<>();
+    private Map<Integer, String> indexToColumnLabel = new HashMap<>();
+    private Map<Integer, String> indexToTableName = new HashMap<>();
 
     private boolean inited = false;
     private boolean delegateExhausted = false;
+
+    // New Rows (Inserts)
     private List<Map<String, Object>> appendedRows = new ArrayList<>();
     private int appendedRowIndex = -1;
     private Map<String, Object> currentVirtualRow = null;
 
-    // Extracted simple equals filter for appended rows
-    // E.g., if query is "WHERE emp_id = 1001", we only want to append rows from ChalkBag where emp_id == 1001
-    // A fully robust solution would implement a SQL expression evaluator, but this covers simple equivalence.
-    private Map<String, String> equalityFilters = new HashMap<>();
-
-    // Track physical PKs to avoid duplicate appends
-    private List<String> physicalPKs = new ArrayList<>();
+    // Filters for newly inserted rows
+    private Map<String, Object> equalityFilters = new HashMap<>();
+    
+    // Seen PKs to avoid duplicates when appending new rows
+    private Set<String> seenPhysicalPKs = new HashSet<>();
 
     public MergedResultSet(ResultSet delegate, String sql) {
+        this(delegate, sql, new HashMap<>());
+    }
+
+    public MergedResultSet(ResultSet delegate, String sql, Map<Integer, Object> statementParameters) {
         super(delegate);
         this.sql = sql;
+        this.statementParameters = statementParameters;
 
         try {
             Statement stmt = CCJSqlParserUtil.parse(sql);
             if (stmt instanceof Select) {
                 Select select = (Select) stmt;
-                TablesNamesFinder tablesNamesFinder = new TablesNamesFinder();
-                List<String> tableList = tablesNamesFinder.getTableList(select);
-                if (tableList != null && !tableList.isEmpty()) {
-                    this.tableName = tableList.get(0).replace("`", "").replace("\"", "");
+                if (select.getSelectBody() instanceof PlainSelect) {
+                    PlainSelect ps = (PlainSelect) select.getSelectBody();
+                    
+                    // 1. Resolve Tables and Aliases
+                    resolveTableAliases(ps);
+                    
+                    // 2. Extract filters for virtual row selection
+                    extractEqualityFilters(ps.getWhere());
                 }
             }
         } catch (Exception e) {
-            // Fallback to basic string parsing if jsqlparser fails
-            try {
-                String lowerSql = sql.toLowerCase();
-                if (lowerSql.contains(" from ")) {
-                    String afterFrom = lowerSql.split(" from ")[1].trim();
-                    String[] words = afterFrom.split("\\s+");
-                    if (words.length > 0) {
-                        this.tableName = words[0].replace("`", "").replace("\"", "").replace(";", "");
-                    }
+            // Fallback for simple single table
+            String lowerSql = sql.toLowerCase();
+            if (lowerSql.contains(" from ")) {
+                String afterFrom = lowerSql.split(" from ")[1].trim();
+                String[] words = afterFrom.split("\\s+");
+                if (words.length > 0) {
+                    String tbl = words[0].replace("`", "").replace("\"", "").replace(";", "");
+                    aliasToTableName.put(tbl, tbl);
                 }
-            } catch (Exception ex) {
-                // Ignore
             }
         }
     }
 
-    private void initColumnMaps() throws SQLException {
+    private void resolveTableAliases(PlainSelect ps) {
+        if (ps.getFromItem() instanceof Table) {
+            Table t = (Table) ps.getFromItem();
+            String name = t.getName().toLowerCase();
+            String alias = (t.getAlias() != null) ? t.getAlias().getName().toLowerCase() : name;
+            aliasToTableName.put(alias, name);
+        }
+        if (ps.getJoins() != null) {
+            for (Join join : ps.getJoins()) {
+                if (join.getRightItem() instanceof Table) {
+                    Table t = (Table) join.getRightItem();
+                    String name = t.getName().toLowerCase();
+                    String alias = (t.getAlias() != null) ? t.getAlias().getName().toLowerCase() : name;
+                    aliasToTableName.put(alias, name);
+                }
+            }
+        }
+    }
+
+    private void extractEqualityFilters(Expression where) {
+        if (where instanceof EqualsTo) {
+            EqualsTo eq = (EqualsTo) where;
+            if (eq.getLeftExpression() instanceof Column) {
+                String col = ((Column) eq.getLeftExpression()).getColumnName().toLowerCase();
+                Expression right = eq.getRightExpression();
+                Object val = null;
+                if (right instanceof LongValue) val = ((LongValue) right).getValue();
+                else if (right instanceof StringValue) val = ((StringValue) right).getValue();
+                else if (right instanceof DoubleValue) val = ((DoubleValue) right).getValue();
+                else if (right instanceof JdbcParameter) {
+                    int pIdx = (((JdbcParameter) right).getIndex() != null) ? ((JdbcParameter) right).getIndex() : 1;
+                    val = statementParameters.get(pIdx);
+                }
+                if (val != null) equalityFilters.put(col, val);
+            }
+        }
+    }
+
+    private void initMetadata() throws SQLException {
         if (!inited) {
             inited = true;
-            try {
-                ResultSetMetaData meta = delegate.getMetaData();
-                int count = meta.getColumnCount();
-                if (count > 0) {
-                    for (int i = 1; i <= count; i++) {
-                        String colName = meta.getColumnLabel(i).toLowerCase();
-                        columnNameToIndex.put(colName, i);
-                        indexToColumnName.put(i, colName);
+            ResultSetMetaData meta = delegate.getMetaData();
+            int count = meta.getColumnCount();
+            for (int i = 1; i <= count; i++) {
+                String label = meta.getColumnLabel(i).toLowerCase();
+                String tblName = meta.getTableName(i).toLowerCase();
+                
+                columnLabelToIndex.put(label, i);
+                indexToColumnLabel.put(i, label);
 
-                        if (tableName == null || tableName.isEmpty()) {
-                            String tbl = meta.getTableName(i);
-                            if (tbl != null && !tbl.isEmpty()) {
-                                tableName = tbl.toLowerCase();
-                            }
+                // Hibernate often doesn't populate getTableName() in JDBC. 
+                // We use column label patterns (like id, id1_0_) to find PKs.
+                if (label.equals("id") || label.endsWith("_id") || label.contains("id")) {
+                    // This is naive, ideally we'd use aliases mapped during SQL parsing
+                }
+                
+                // Track which table this column belongs to if possible
+                if (tblName != null && !tblName.isEmpty()) {
+                    indexToTableName.put(i, tblName);
+                    if (label.equals("id")) {
+                        tablePkColumnIndex.put(tblName, i);
+                    }
+                } else {
+                    // Heuristic for Hibernate aliases: employee0_.id -> employee0_
+                    // We try to match with our aliases
+                    for (String alias : aliasToTableName.keySet()) {
+                        if (label.startsWith(alias + ".")) {
+                             indexToTableName.put(i, aliasToTableName.get(alias));
+                             if (label.endsWith(".id")) tablePkColumnIndex.put(aliasToTableName.get(alias), i);
                         }
                     }
                 }
-            } catch (SQLException e) {
-                // Ignore, might happen if ResultSet is already closed or empty
+            }
+            
+            // Fallback for primary table if only one PK found
+            if (tablePkColumnIndex.size() == 0 && columnLabelToIndex.containsKey("id")) {
+                String mainTable = aliasToTableName.values().stream().findFirst().orElse(null);
+                if (mainTable != null) tablePkColumnIndex.put(mainTable, columnLabelToIndex.get("id"));
             }
 
-            // Prepare appended rows from ChalkBag
-            if (tableName != null) {
-                Map<String, Map<String, Object>> tableState = ChalkBag.get().getTable(tableName);
-                if (tableState != null) {
-                    for (Map.Entry<String, Map<String, Object>> entry : tableState.entrySet()) {
-                        if (entry.getValue() != null && !ChalkBag.get().isTombstoned(tableName, entry.getKey())) {
+            // Load Virtual rows for "Append" phase
+            loadAppendedRows();
+        }
+    }
 
-                            // Check basic filter
-                            // For a robust enterprise implementation, we would evaluate the AST Where expression
-                            // against the virtual row. We'll allow all for now and let the business logic filter,
-                            // or rely on a more complex evaluator.
-                            boolean matches = true;
-                            // Add expression evaluation here in the future
-
-                            if (matches) {
-                                Map<String, Object> rowCopy = new HashMap<>(entry.getValue());
-                                rowCopy.put("__boulder_pk", entry.getKey());
-                                appendedRows.add(rowCopy);
+    private void loadAppendedRows() {
+        // Only append for the "Primary" table in a query for simplicity in this proxy.
+        String primaryTable = aliasToTableName.values().stream().findFirst().orElse(null);
+        if (primaryTable != null) {
+            Map<String, Map<String, Object>> tableData = ChalkBag.get().getTable(primaryTable);
+            if (tableData != null) {
+                for (Map.Entry<String, Map<String, Object>> entry : tableData.entrySet()) {
+                    if (entry.getValue() != null && !ChalkBag.get().isTombstoned(primaryTable, entry.getKey())) {
+                        
+                        // Simple Filter
+                        boolean matches = true;
+                        for (Map.Entry<String, Object> f : equalityFilters.entrySet()) {
+                            Object rv = entry.getValue().get(f.getKey());
+                            if (rv == null || !rv.toString().equals(f.getValue().toString())) {
+                                matches = false; break;
                             }
+                        }
+                        
+                        if (matches) {
+                            Map<String, Object> row = new HashMap<>(entry.getValue());
+                            row.put("__boulder_pk", entry.getKey());
+                            appendedRows.add(row);
                         }
                     }
                 }
@@ -124,48 +211,38 @@ public class MergedResultSet extends PitonResultSetDecorator {
 
     @Override
     public boolean next() throws SQLException {
-        initColumnMaps();
-
+        initMetadata();
+        
         if (delegateExhausted) {
-            return nextAppendedRow();
+            return nextVirtualRow();
         }
 
-        boolean hasNext = false;
-        try {
-            while ((hasNext = delegate.next())) {
-                Integer pkIndex = columnNameToIndex.get(pkColumnName);
-                if (pkIndex != null && tableName != null) {
-                    Object pkVal = delegate.getObject(pkIndex);
-                    if (pkVal != null) {
-                        String pkStr = pkVal.toString();
-                        physicalPKs.add(pkStr);
-                        if (ChalkBag.get().isTombstoned(tableName, pkStr)) {
-                            continue;
-                        }
-                        return true;
+        while (delegate.next()) {
+            boolean tombstoned = false;
+            // Check all tables involved in this row for tombstones
+            for (Map.Entry<String, Integer> entry : tablePkColumnIndex.entrySet()) {
+                Object pk = delegate.getObject(entry.getValue());
+                if (pk != null) {
+                    String pkStr = pk.toString();
+                    seenPhysicalPKs.add(pkStr);
+                    if (ChalkBag.get().isTombstoned(entry.getKey(), pkStr)) {
+                        tombstoned = true;
+                        break;
                     }
                 }
-                return true;
             }
-        } catch (SQLException e) {
-            // Probably exhausted or closed
+            if (!tombstoned) return true;
         }
 
         delegateExhausted = true;
-
-        // Exclude appended rows that we already yielded physically
-        Iterator<Map<String, Object>> it = appendedRows.iterator();
-        while (it.hasNext()) {
-            Map<String, Object> row = it.next();
-            if (physicalPKs.contains(row.get("__boulder_pk"))) {
-                it.remove();
-            }
-        }
-
-        return nextAppendedRow();
+        
+        // Remove virtual rows that we already saw physically
+        appendedRows.removeIf(row -> seenPhysicalPKs.contains(row.get("__boulder_pk")));
+        
+        return nextVirtualRow();
     }
 
-    private boolean nextAppendedRow() {
+    private boolean nextVirtualRow() {
         appendedRowIndex++;
         if (appendedRowIndex < appendedRows.size()) {
             currentVirtualRow = appendedRows.get(appendedRowIndex);
@@ -174,143 +251,91 @@ public class MergedResultSet extends PitonResultSetDecorator {
         return false;
     }
 
-    private Object getMergedValue(int columnIndex) throws SQLException {
-        if (delegateExhausted) {
-            if (currentVirtualRow == null) return null;
-            String colName = indexToColumnName.get(columnIndex);
-            if (colName != null) {
-                // Ignore case mapping
-                for (String key : currentVirtualRow.keySet()) {
-                     if (key.equalsIgnoreCase(colName)) {
-                         return currentVirtualRow.get(key);
-                     }
-                }
-            }
-            return null;
-        }
-
-        if (tableName != null) {
-            String colName = indexToColumnName.get(columnIndex);
-            if (colName != null) {
-                try {
-                    Integer pkIndex = columnNameToIndex.get(pkColumnName);
-                    if (pkIndex != null) {
-                        Object pkVal = delegate.getObject(pkIndex);
-                        if (pkVal != null) {
-                            String pkStr = pkVal.toString();
-                            Map<String, Object> diffRow = ChalkBag.get().getRow(tableName, pkStr);
-                            if (diffRow != null) {
-                                for (String key : diffRow.keySet()) {
-                                    if (key.equalsIgnoreCase(colName)) {
-                                        return diffRow.get(key);
-                                    }
-                                }
-                            }
-                        }
-                    }
-                } catch (Exception e) {
-                }
-            }
-        }
-
-        return delegate.getObject(columnIndex);
-    }
-
-    private Object getMergedValue(String columnLabel) throws SQLException {
-        if (delegateExhausted) {
-            if (currentVirtualRow == null) return null;
-            for (String key : currentVirtualRow.keySet()) {
-                 if (key.equalsIgnoreCase(columnLabel)) {
-                     return currentVirtualRow.get(key);
-                 }
-            }
-            return null;
-        }
-
-        if (tableName != null) {
-            String colName = columnLabel;
-            try {
-                Integer pkIndex = columnNameToIndex.get(pkColumnName);
-                if (pkIndex != null) {
-                    Object pkVal = delegate.getObject(pkIndex);
-                    if (pkVal != null) {
-                        String pkStr = pkVal.toString();
-                        Map<String, Object> diffRow = ChalkBag.get().getRow(tableName, pkStr);
-                        if (diffRow != null) {
-                            for (String key : diffRow.keySet()) {
-                                if (key.equalsIgnoreCase(colName)) {
-                                    return diffRow.get(key);
-                                }
-                            }
-                        }
-                    }
-                }
-            } catch (Exception e) {
-            }
-        }
-
-        return delegate.getObject(columnLabel);
-    }
-
     @Override
     public Object getObject(int columnIndex) throws SQLException {
-        return getMergedValue(columnIndex);
+        if (delegateExhausted) {
+            if (currentVirtualRow == null) return null;
+            String label = indexToColumnLabel.get(columnIndex);
+            return currentVirtualRow.get(label);
+        }
+
+        // Overlay logic: Check if this column belongs to a table that has a patch
+        String table = indexToTableName.get(columnIndex);
+        if (table != null) {
+            Integer pkIdx = tablePkColumnIndex.get(table);
+            if (pkIdx != null) {
+                Object pk = delegate.getObject(pkIdx);
+                if (pk != null) {
+                    Map<String, Object> patch = ChalkBag.get().getRow(table, pk.toString());
+                    if (patch != null) {
+                        String label = indexToColumnLabel.get(columnIndex);
+                        if (patch.containsKey(label)) return patch.get(label);
+                    }
+                }
+            }
+        }
+        
+        return delegate.getObject(columnIndex);
     }
 
     @Override
     public Object getObject(String columnLabel) throws SQLException {
-        return getMergedValue(columnLabel);
+        Integer idx = columnLabelToIndex.get(columnLabel.toLowerCase());
+        if (idx != null) return getObject(idx);
+        return delegate.getObject(columnLabel);
     }
 
     @Override
     public String getString(int columnIndex) throws SQLException {
-        Object val = getMergedValue(columnIndex);
-        return val == null ? null : val.toString();
+        Object val = getObject(columnIndex);
+        return (val == null) ? null : val.toString();
     }
 
     @Override
     public String getString(String columnLabel) throws SQLException {
-        Object val = getMergedValue(columnLabel);
-        return val == null ? null : val.toString();
+        Object val = getObject(columnLabel);
+        return (val == null) ? null : val.toString();
     }
 
     @Override
     public int getInt(int columnIndex) throws SQLException {
-        Object val = getMergedValue(columnIndex);
-        if (val == null) return 0;
-        if (val instanceof Number) return ((Number)val).intValue();
-        if (val instanceof String) return Integer.parseInt((String)val);
-        if (delegateExhausted) return 0;
-        return delegate.getInt(columnIndex);
+        Object val = getObject(columnIndex);
+        if (val instanceof Number) return ((Number) val).intValue();
+        return (val == null) ? 0 : Integer.parseInt(val.toString());
     }
 
     @Override
     public int getInt(String columnLabel) throws SQLException {
-        Object val = getMergedValue(columnLabel);
-        if (val == null) return 0;
-        if (val instanceof Number) return ((Number)val).intValue();
-        if (val instanceof String) return Integer.parseInt((String)val);
-        if (delegateExhausted) return 0;
-        return delegate.getInt(columnLabel);
+        Object val = getObject(columnLabel);
+        if (val instanceof Number) return ((Number) val).intValue();
+        return (val == null) ? 0 : Integer.parseInt(val.toString());
     }
 
     @Override
     public double getDouble(int columnIndex) throws SQLException {
-        Object val = getMergedValue(columnIndex);
-        if (val == null) return 0.0;
-        if (val instanceof Number) return ((Number)val).doubleValue();
-        if (val instanceof String) return Double.parseDouble((String)val);
-        if (delegateExhausted) return 0.0;
-        return delegate.getDouble(columnIndex);
+        Object val = getObject(columnIndex);
+        if (val instanceof Number) return ((Number) val).doubleValue();
+        return (val == null) ? 0.0 : Double.parseDouble(val.toString());
     }
 
     @Override
     public double getDouble(String columnLabel) throws SQLException {
-        Object val = getMergedValue(columnLabel);
-        if (val == null) return 0.0;
-        if (val instanceof Number) return ((Number)val).doubleValue();
-        if (val instanceof String) return Double.parseDouble((String)val);
-        if (delegateExhausted) return 0.0;
-        return delegate.getDouble(columnLabel);
+        Object val = getObject(columnLabel);
+        if (val instanceof Number) return ((Number) val).doubleValue();
+        return (val == null) ? 0.0 : Double.parseDouble(val.toString());
+    }
+
+    @Override
+    public long getLong(int columnIndex) throws SQLException {
+        Object val = getObject(columnIndex);
+        if (val instanceof Number) return ((Number) val).longValue();
+        return (val == null) ? 0L : Long.parseLong(val.toString());
+    }
+
+    @Override
+    public long getLong(String columnLabel) throws SQLException {
+        Object val = getObject(columnLabel);
+        if (val instanceof Number) return ((Number) val).longValue();
+        return (val == null) ? 0L : Long.parseLong(val.toString());
     }
 }

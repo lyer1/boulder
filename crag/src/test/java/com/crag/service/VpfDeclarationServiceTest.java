@@ -158,4 +158,111 @@ public class VpfDeclarationServiceTest {
             }
         }
     }
+
+    @Test
+    public void testNativeUpdateAndReadFlow() throws Exception {
+        EntityManager em = emf.createEntityManager();
+        em.getTransaction().begin();
+
+        // Perform a native UPDATE
+        Query q = em.createNativeQuery("UPDATE vpf_table SET percent = 25.0 WHERE emp_id = 1001");
+        int rowsUpdated = q.executeUpdate();
+        assertEquals(1, rowsUpdated, "Native UPDATE should report 1 row updated");
+
+        em.flush();
+        em.clear();
+
+        VpfDeclarationDS ds = new VpfDeclarationDS(em);
+        List<Object[]> rows = ds.getVpfDetailsNative(1001);
+
+        assertEquals(1, rows.size());
+        assertEquals(25.0, ((Number) rows.get(0)[2]).doubleValue(), "Native Read should see the updated value 25.0");
+
+        em.getTransaction().commit();
+        em.close();
+
+        // Verify physical database is untouched!
+        try (Connection conn = DriverManager.getConnection("jdbc:h2:mem:cragdb;DB_CLOSE_DELAY=-1", "sa", "")) {
+            try (Statement stmt = conn.createStatement()) {
+                ResultSet rs = stmt.executeQuery("SELECT percent FROM vpf_table WHERE emp_id = 1001");
+                rs.next();
+                double physicalPercent = rs.getDouble(1);
+                assertEquals(12.0, physicalPercent, "Physical DB must not be modified by native update");
+            }
+        }
+    }
+
+    @Test
+    public void testMultipleInsertsAndReads() throws Exception {
+        EntityManager em = emf.createEntityManager();
+        em.getTransaction().begin();
+
+        VpfDeclaration d1 = new VpfDeclaration();
+        d1.setEmpId(4001); d1.setContributionPercent(10.0); d1.setStatus("ACTIVE");
+        em.persist(d1);
+
+        VpfDeclaration d2 = new VpfDeclaration();
+        d2.setEmpId(4002); d2.setContributionPercent(15.0); d2.setStatus("ACTIVE");
+        em.persist(d2);
+
+        em.flush();
+        em.clear();
+
+        VpfDeclarationDS ds = new VpfDeclarationDS(em);
+        
+        List<Object[]> rows1 = ds.getVpfDetailsNative(4001);
+        assertEquals(1, rows1.size());
+        assertEquals(10.0, ((Number) rows1.get(0)[2]).doubleValue());
+
+        List<Object[]> rows2 = ds.getVpfDetailsNative(4002);
+        assertEquals(1, rows2.size());
+        assertEquals(15.0, ((Number) rows2.get(0)[2]).doubleValue());
+
+        em.getTransaction().commit();
+        em.close();
+
+        // Verify physical database is untouched!
+        try (Connection conn = DriverManager.getConnection("jdbc:h2:mem:cragdb;DB_CLOSE_DELAY=-1", "sa", "")) {
+            try (Statement stmt = conn.createStatement()) {
+                ResultSet rs = stmt.executeQuery("SELECT COUNT(*) FROM vpf_table WHERE emp_id IN (4001, 4002)");
+                rs.next();
+                assertEquals(0, rs.getInt(1), "Physical DB must not contain newly inserted rows");
+            }
+        }
+    }
+
+    @Test
+    public void testUpdateMultipleRowsFlow() throws Exception {
+        EntityManager em = emf.createEntityManager();
+        em.getTransaction().begin();
+
+        // 1. Initial State: emp 1001 has 12% in physical DB
+        // 2. Insert emp 1002 via proxy
+        VpfDeclaration d2 = new VpfDeclaration();
+        d2.setEmpId(1002); d2.setContributionPercent(15.0); d2.setStatus("ACTIVE");
+        em.persist(d2);
+        em.flush();
+
+        // 3. Native Update both rows (one physical, one proxy)
+        // Note: Our current proxy simple PK extraction might struggle here if it's not ID based.
+        // But let's see how it behaves.
+        Query q = em.createNativeQuery("UPDATE vpf_table SET percent = 30.0 WHERE status = 'ACTIVE'");
+        q.executeUpdate();
+
+        em.flush();
+        em.clear();
+
+        VpfDeclarationDS ds = new VpfDeclarationDS(em);
+        
+        // Check 1001
+        List<Object[]> r1 = ds.getVpfDetailsNative(1001);
+        assertEquals(30.0, ((Number) r1.get(0)[2]).doubleValue(), "Physical row (resolved via PK) should be updated in proxy"); 
+
+        // Check 1002
+        List<Object[]> r2 = ds.getVpfDetailsNative(1002);
+        assertEquals(30.0, ((Number) r2.get(0)[2]).doubleValue(), "Virtual row (resolved via ChalkBag search) should be updated in proxy");
+
+        em.getTransaction().commit();
+        em.close();
+    }
 }
