@@ -12,7 +12,14 @@ import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 
+import net.sf.jsqlparser.expression.Expression;
+import net.sf.jsqlparser.expression.LongValue;
+import net.sf.jsqlparser.expression.StringValue;
+import net.sf.jsqlparser.expression.DoubleValue;
+import net.sf.jsqlparser.expression.JdbcParameter;
+import net.sf.jsqlparser.expression.operators.relational.EqualsTo;
 import net.sf.jsqlparser.parser.CCJSqlParserUtil;
+import net.sf.jsqlparser.schema.Column;
 import net.sf.jsqlparser.statement.Statement;
 import net.sf.jsqlparser.statement.select.PlainSelect;
 import net.sf.jsqlparser.statement.select.Select;
@@ -21,6 +28,7 @@ import net.sf.jsqlparser.util.TablesNamesFinder;
 public class MergedResultSet extends PitonResultSetDecorator {
 
     private final String sql;
+    private final Map<Integer, Object> statementParameters;
     private Map<String, Integer> columnNameToIndex = new HashMap<>();
     private Map<Integer, String> indexToColumnName = new HashMap<>();
 
@@ -33,17 +41,17 @@ public class MergedResultSet extends PitonResultSetDecorator {
     private int appendedRowIndex = -1;
     private Map<String, Object> currentVirtualRow = null;
 
-    // Extracted simple equals filter for appended rows
-    // E.g., if query is "WHERE emp_id = 1001", we only want to append rows from ChalkBag where emp_id == 1001
-    // A fully robust solution would implement a SQL expression evaluator, but this covers simple equivalence.
-    private Map<String, String> equalityFilters = new HashMap<>();
-
-    // Track physical PKs to avoid duplicate appends
+    private Map<String, Object> equalityFilters = new HashMap<>();
     private List<String> physicalPKs = new ArrayList<>();
 
     public MergedResultSet(ResultSet delegate, String sql) {
+        this(delegate, sql, new HashMap<>());
+    }
+
+    public MergedResultSet(ResultSet delegate, String sql, Map<Integer, Object> statementParameters) {
         super(delegate);
         this.sql = sql;
+        this.statementParameters = statementParameters;
 
         try {
             Statement stmt = CCJSqlParserUtil.parse(sql);
@@ -54,9 +62,13 @@ public class MergedResultSet extends PitonResultSetDecorator {
                 if (tableList != null && !tableList.isEmpty()) {
                     this.tableName = tableList.get(0).replace("`", "").replace("\"", "");
                 }
+
+                if (select.getSelectBody() instanceof PlainSelect) {
+                    PlainSelect ps = (PlainSelect) select.getSelectBody();
+                    extractEqualityFilters(ps.getWhere());
+                }
             }
         } catch (Exception e) {
-            // Fallback to basic string parsing if jsqlparser fails
             try {
                 String lowerSql = sql.toLowerCase();
                 if (lowerSql.contains(" from ")) {
@@ -66,8 +78,35 @@ public class MergedResultSet extends PitonResultSetDecorator {
                         this.tableName = words[0].replace("`", "").replace("\"", "").replace(";", "");
                     }
                 }
-            } catch (Exception ex) {
-                // Ignore
+            } catch (Exception ex) {}
+        }
+    }
+
+    private void extractEqualityFilters(Expression where) {
+        if (where instanceof EqualsTo) {
+            EqualsTo eq = (EqualsTo) where;
+            if (eq.getLeftExpression() instanceof Column) {
+                String col = ((Column) eq.getLeftExpression()).getColumnName().toLowerCase();
+                Expression right = eq.getRightExpression();
+                if (right instanceof LongValue) {
+                    equalityFilters.put(col, ((LongValue) right).getValue());
+                } else if (right instanceof StringValue) {
+                    equalityFilters.put(col, ((StringValue) right).getValue());
+                } else if (right instanceof DoubleValue) {
+                    equalityFilters.put(col, ((DoubleValue) right).getValue());
+                } else if (right instanceof JdbcParameter) {
+                    JdbcParameter param = (JdbcParameter) right;
+                    int index = param.getIndex();
+                    // JSqlParser indices might be 1-based or 0-based depending on version and presence of '?'
+                    // Usually for '?' it is null index and we have to count.
+                    // If it's just '?', param.getIndex() might be null or 1.
+                    // Let's try 1 if it's null, or the index itself.
+                    int pIdx = (param.getIndex() != null) ? param.getIndex() : 1;
+                    Object val = statementParameters.get(pIdx);
+                    if (val != null) {
+                        equalityFilters.put(col, val);
+                    }
+                }
             }
         }
     }
@@ -92,23 +131,29 @@ public class MergedResultSet extends PitonResultSetDecorator {
                         }
                     }
                 }
-            } catch (SQLException e) {
-                // Ignore, might happen if ResultSet is already closed or empty
-            }
+            } catch (SQLException e) {}
 
-            // Prepare appended rows from ChalkBag
             if (tableName != null) {
                 Map<String, Map<String, Object>> tableState = ChalkBag.get().getTable(tableName);
                 if (tableState != null) {
                     for (Map.Entry<String, Map<String, Object>> entry : tableState.entrySet()) {
                         if (entry.getValue() != null && !ChalkBag.get().isTombstoned(tableName, entry.getKey())) {
-
-                            // Check basic filter
-                            // For a robust enterprise implementation, we would evaluate the AST Where expression
-                            // against the virtual row. We'll allow all for now and let the business logic filter,
-                            // or rely on a more complex evaluator.
+                            
+                            // Apply filters
                             boolean matches = true;
-                            // Add expression evaluation here in the future
+                            for (Map.Entry<String, Object> filter : equalityFilters.entrySet()) {
+                                Object rowVal = null;
+                                for (String key : entry.getValue().keySet()) {
+                                    if (key.equalsIgnoreCase(filter.getKey())) {
+                                        rowVal = entry.getValue().get(key);
+                                        break;
+                                    }
+                                }
+                                if (rowVal == null || !rowVal.toString().equals(filter.getValue().toString())) {
+                                    matches = false;
+                                    break;
+                                }
+                            }
 
                             if (matches) {
                                 Map<String, Object> rowCopy = new HashMap<>(entry.getValue());
@@ -147,13 +192,10 @@ public class MergedResultSet extends PitonResultSetDecorator {
                 }
                 return true;
             }
-        } catch (SQLException e) {
-            // Probably exhausted or closed
-        }
+        } catch (SQLException e) {}
 
         delegateExhausted = true;
 
-        // Exclude appended rows that we already yielded physically
         Iterator<Map<String, Object>> it = appendedRows.iterator();
         while (it.hasNext()) {
             Map<String, Object> row = it.next();
@@ -179,7 +221,6 @@ public class MergedResultSet extends PitonResultSetDecorator {
             if (currentVirtualRow == null) return null;
             String colName = indexToColumnName.get(columnIndex);
             if (colName != null) {
-                // Ignore case mapping
                 for (String key : currentVirtualRow.keySet()) {
                      if (key.equalsIgnoreCase(colName)) {
                          return currentVirtualRow.get(key);
@@ -208,8 +249,7 @@ public class MergedResultSet extends PitonResultSetDecorator {
                             }
                         }
                     }
-                } catch (Exception e) {
-                }
+                } catch (Exception e) {}
             }
         }
 
@@ -245,8 +285,7 @@ public class MergedResultSet extends PitonResultSetDecorator {
                         }
                     }
                 }
-            } catch (Exception e) {
-            }
+            } catch (Exception e) {}
         }
 
         return delegate.getObject(columnLabel);
