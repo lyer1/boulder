@@ -16,6 +16,8 @@ public class PitonPreparedStatement extends PitonStatement implements PreparedSt
     private final Map<Integer, Object> parameters = new HashMap<>();
     private final List<Map<Integer, Object>> batchParameters = new ArrayList<>();
 
+    private ResultSet generatedKeysResultSet = null;
+
     public PitonPreparedStatement(PreparedStatement delegate, String sql) {
         super(delegate);
         this.delegatePreparedStatement = delegate;
@@ -24,6 +26,15 @@ public class PitonPreparedStatement extends PitonStatement implements PreparedSt
 
     @Override
     public ResultSet executeQuery() throws SQLException {
+        String lowerSql = sql.toLowerCase().trim();
+        if (lowerSql.startsWith("select next value for") || lowerSql.startsWith("call next value for")) {
+             // Mocking Hibernate Sequence Generator if it uses sequences
+             List<Integer> keys = new ArrayList<>();
+             keys.add(com.boulder.state.ChalkBag.get().generateId());
+             return new GeneratedKeysResultSet(keys);
+        }
+
+        System.out.println("PitonPreparedStatement.executeQuery() called with sql: " + sql + ", parameters: " + parameters);
         ResultSet rs = delegatePreparedStatement.executeQuery();
         return new PitonResultSet(rs, sql);
     }
@@ -31,11 +42,34 @@ public class PitonPreparedStatement extends PitonStatement implements PreparedSt
     @Override
     public int executeUpdate() throws SQLException {
         String lowerSql = sql.toLowerCase().trim();
-        if (lowerSql.startsWith("update") || lowerSql.startsWith("delete")) {
-            DynoMerger.interceptWrite(sql, parameters);
-            return 1;
+        System.out.println("PitonPreparedStatement.executeUpdate() called with sql: " + sql + ", parameters: " + parameters);
+        if (lowerSql.startsWith("insert") || lowerSql.startsWith("update") || lowerSql.startsWith("delete")) {
+            List<Integer> keys = DynoMerger.interceptWriteWithKeys(sql, parameters);
+            if (keys != null && !keys.isEmpty()) {
+                 this.generatedKeysResultSet = new GeneratedKeysResultSet(keys);
+            }
+            return 1; // Do NOT execute on delegate
         }
         return delegatePreparedStatement.executeUpdate();
+    }
+
+    @Override
+    public ResultSet getGeneratedKeys() throws SQLException {
+        if (generatedKeysResultSet != null) {
+            // Need to create a new instance because Hibernate reads and closes it,
+            // or we must properly reset. Creating new is safer.
+            // generatedKeysResultSet.beforeFirst() doesn't seem to reset for hibernate correctly if it expects a pristine RS
+            // We should just return the generatedKeysResultSet if it hasn't been closed, or if we track keys.
+            // For now, let's just create a new one to be absolutely safe
+            if (generatedKeysResultSet instanceof GeneratedKeysResultSet) {
+                return new GeneratedKeysResultSet(((GeneratedKeysResultSet)generatedKeysResultSet).getGeneratedKeysList());
+            }
+            return generatedKeysResultSet;
+        }
+
+        // Sometimes Hibernate calls this even if generatedKeysResultSet wasn't populated explicitly.
+        // It expects at least an empty result set instead of null.
+        return new GeneratedKeysResultSet(new ArrayList<>());
     }
 
     @Override
@@ -64,6 +98,7 @@ public class PitonPreparedStatement extends PitonStatement implements PreparedSt
 
     @Override
     public void setInt(int parameterIndex, int x) throws SQLException {
+        System.out.println("setInt called: index=" + parameterIndex + ", val=" + x);
         parameters.put(parameterIndex, x);
         delegatePreparedStatement.setInt(parameterIndex, x);
     }
@@ -157,9 +192,13 @@ public class PitonPreparedStatement extends PitonStatement implements PreparedSt
 
     @Override
     public boolean execute() throws SQLException {
+        System.out.println("PitonPreparedStatement.execute() called with sql: " + sql + ", parameters: " + parameters);
         String lowerSql = sql.toLowerCase().trim();
-        if (lowerSql.startsWith("update") || lowerSql.startsWith("delete")) {
-            DynoMerger.interceptWrite(sql, parameters);
+        if (lowerSql.startsWith("insert") || lowerSql.startsWith("update") || lowerSql.startsWith("delete")) {
+            List<Integer> keys = DynoMerger.interceptWriteWithKeys(sql, parameters);
+            if (keys != null && !keys.isEmpty()) {
+                 this.generatedKeysResultSet = new GeneratedKeysResultSet(keys);
+            }
             return false;
         }
         return delegatePreparedStatement.execute();
@@ -168,7 +207,7 @@ public class PitonPreparedStatement extends PitonStatement implements PreparedSt
     @Override
     public void addBatch() throws SQLException {
         String lowerSql = sql.toLowerCase().trim();
-        if (lowerSql.startsWith("update") || lowerSql.startsWith("delete")) {
+        if (lowerSql.startsWith("insert") || lowerSql.startsWith("update") || lowerSql.startsWith("delete")) {
             batchParameters.add(new HashMap<>(parameters));
         } else {
             delegatePreparedStatement.addBatch();
@@ -183,11 +222,15 @@ public class PitonPreparedStatement extends PitonStatement implements PreparedSt
 
     @Override
     public int[] executeBatch() throws SQLException {
+        System.out.println("PitonPreparedStatement.executeBatch() called with sql: " + sql);
         String lowerSql = sql.toLowerCase().trim();
-        if (lowerSql.startsWith("update") || lowerSql.startsWith("delete")) {
+        if (lowerSql.startsWith("insert") || lowerSql.startsWith("update") || lowerSql.startsWith("delete")) {
             int[] results = new int[batchParameters.size()];
             for (int i = 0; i < batchParameters.size(); i++) {
-                DynoMerger.interceptWrite(sql, batchParameters.get(i));
+                List<Integer> keys = DynoMerger.interceptWriteWithKeys(sql, batchParameters.get(i));
+                if (keys != null && !keys.isEmpty()) {
+                     this.generatedKeysResultSet = new GeneratedKeysResultSet(keys);
+                }
                 results[i] = 1;
             }
             batchParameters.clear();

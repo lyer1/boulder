@@ -2,6 +2,7 @@ package com.boulder.state;
 
 import java.util.HashMap;
 import java.util.Map;
+import java.util.concurrent.atomic.AtomicInteger;
 
 public class ChalkBag {
 
@@ -18,7 +19,20 @@ public class ChalkBag {
     // TableName -> PrimaryKey -> ColumnName -> Value
     private final Map<String, Map<String, Map<String, Object>>> state = new HashMap<>();
 
+    // Auto-increment counter for generated keys (starting high to avoid physical db conflicts)
+    private final AtomicInteger idGenerator = new AtomicInteger(1000000);
+
     public static final Object TOMBSTONE = new Object();
+
+    public int generateId() {
+        return idGenerator.incrementAndGet();
+    }
+
+    public void insert(String table, String pk, Map<String, Object> values) {
+        table = table.toLowerCase();
+        state.computeIfAbsent(table, k -> new HashMap<>())
+             .put(pk, new HashMap<>(values));
+    }
 
     public void update(String table, String pk, Map<String, Object> values) {
         table = table.toLowerCase();
@@ -49,8 +63,6 @@ public class ChalkBag {
         table = table.toLowerCase();
         Map<String, Map<String, Object>> tableState = state.get(table);
         if (tableState != null) {
-            // Because ResultSet returns Object which we toString(), ensure we match
-            // both integer representation "1" and float representation "1.0"
             if (tableState.containsKey(pk) && tableState.get(pk) == null) {
                 return true;
             }
@@ -67,5 +79,9 @@ public class ChalkBag {
             }
         }
         return false;
+    }
+
+    public Map<String, Map<String, Object>> getTable(String table) {
+        return state.get(table.toLowerCase());
     }
 }

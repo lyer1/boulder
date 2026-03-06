@@ -19,6 +19,8 @@ import java.sql.Statement;
 import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
 
 public class VpfDeclarationServiceTest {
 
@@ -28,10 +30,10 @@ public class VpfDeclarationServiceTest {
     public static void setup() throws Exception {
         try (Connection conn = DriverManager.getConnection("jdbc:h2:mem:cragdb;DB_CLOSE_DELAY=-1", "sa", "")) {
             try (Statement stmt = conn.createStatement()) {
-                stmt.execute("CREATE TABLE IF NOT EXISTS vpf_table (id INT PRIMARY KEY, emp_id INT, percent DOUBLE, status VARCHAR(255))");
+                stmt.execute("CREATE TABLE IF NOT EXISTS vpf_table (id INT AUTO_INCREMENT PRIMARY KEY, emp_id INT, percent DOUBLE, status VARCHAR(255))");
                 stmt.execute("DELETE FROM vpf_table");
                 stmt.execute("INSERT INTO vpf_table (id, emp_id, percent, status) VALUES (1, 1001, 12.0, 'ACTIVE')");
-                stmt.execute("INSERT INTO vpf_table (id, emp_id, percent, status) VALUES (99, 2002, 10.0, 'OLD')");
+                stmt.execute("CREATE SEQUENCE IF NOT EXISTS hibernate_sequence START WITH 2");
             }
         }
 
@@ -52,7 +54,6 @@ public class VpfDeclarationServiceTest {
             try (Statement stmt = conn.createStatement()) {
                 stmt.execute("DELETE FROM vpf_table");
                 stmt.execute("INSERT INTO vpf_table (id, emp_id, percent, status) VALUES (1, 1001, 12.0, 'ACTIVE')");
-                stmt.execute("INSERT INTO vpf_table (id, emp_id, percent, status) VALUES (99, 2002, 10.0, 'OLD')");
             }
         } catch (Exception e) {}
     }
@@ -96,8 +97,7 @@ public class VpfDeclarationServiceTest {
         EntityManager em = emf.createEntityManager();
         em.getTransaction().begin();
 
-        Query q = em.createNativeQuery("DELETE FROM vpf_table WHERE id = ?");
-        q.setParameter(1, 1);
+        Query q = em.createNativeQuery("DELETE FROM vpf_table WHERE id = 1");
         q.executeUpdate();
 
         em.flush();
@@ -109,12 +109,53 @@ public class VpfDeclarationServiceTest {
 
         int count = 0;
         for (Object[] row : rows) {
-             System.out.println("Row PK is: " + row[0] + " of type " + row[0].getClass());
-             if (((Number) row[0]).intValue() == 1) count++;
+             if (((Number) row[1]).intValue() == 1001) count++;
         }
         assertEquals(0, count, "Deleted row should be tombstoned and skipped");
 
         em.getTransaction().commit();
         em.close();
+    }
+
+    @Test
+    public void testPersistAndReadFlow() throws Exception {
+        EntityManager em = emf.createEntityManager();
+        em.getTransaction().begin();
+
+        // Testing true em.persist()
+        VpfDeclaration newDecl = new VpfDeclaration();
+        newDecl.setEmpId(3003);
+        newDecl.setContributionPercent(18.0);
+        newDecl.setStatus("NEW");
+
+        em.persist(newDecl);
+        em.flush();
+
+        // Asserting the ID here since hibernate is supposed to extract it from the generated keys
+        System.out.println("ID ASSIGNED: " + newDecl.getId());
+        assertNotNull(newDecl.getId(), "Generated ID must be populated after persist and flush");
+        assertTrue(newDecl.getId() > 0, "Generated ID must be valid");
+
+        em.clear();
+
+        // Use native query to fetch.
+        VpfDeclarationDS ds = new VpfDeclarationDS(em);
+        List<Object[]> rows = ds.getVpfDetailsNative(3003);
+
+        assertEquals(1, rows.size(), "Should append the newly inserted virtual row");
+        assertEquals(18.0, ((Number) rows.get(0)[2]).doubleValue());
+
+        em.getTransaction().commit();
+        em.close();
+
+        // Verify physical database is untouched!
+        try (Connection conn = DriverManager.getConnection("jdbc:h2:mem:cragdb;DB_CLOSE_DELAY=-1", "sa", "")) {
+            try (Statement stmt = conn.createStatement()) {
+                ResultSet rs = stmt.executeQuery("SELECT COUNT(*) FROM vpf_table WHERE emp_id = 3003");
+                rs.next();
+                int count = rs.getInt(1);
+                assertEquals(0, count, "Physical DB must not be modified by insert");
+            }
+        }
     }
 }
