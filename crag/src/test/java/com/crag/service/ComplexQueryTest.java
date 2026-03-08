@@ -64,7 +64,6 @@ public class ComplexQueryTest {
         em.remove(e1);
         
         HrEmployee e3 = new HrEmployee();
-        e3.setEmployeeId(103L);
         e3.setSysTenantId(10);
         em.merge(e3);
         
@@ -85,17 +84,16 @@ public class ComplexQueryTest {
         em.getTransaction().begin();
 
         OrgUser newUser = new OrgUser();
-        newUser.setUserID(500L);
         newUser.setUserName("initial_name");
         newUser.setOrganizationID(999);
-        em.merge(newUser);
+        newUser = em.merge(newUser);
         em.flush();
 
         newUser.setUserName("chained_update");
-        em.merge(newUser);
+        newUser = em.merge(newUser);
         em.flush();
 
-        OrgUser fetched = em.find(OrgUser.class, 500L);
+        OrgUser fetched = em.find(OrgUser.class, newUser.getUserID());
         assertNotNull(fetched, "Should find the virtual row");
         assertEquals("chained_update", fetched.getUserName(), "Proxy should support chained virtual operations");
 
@@ -130,25 +128,23 @@ public class ComplexQueryTest {
         em.getTransaction().begin();
 
         SysUser vUser = new SysUser();
-        vUser.setUserId(99L);
         vUser.setUsername("virtual_user");
         vUser.setEnabled(true);
-        em.merge(vUser);
+        vUser = em.merge(vUser);
 
         HrEmployee vEmp = new HrEmployee();
-        vEmp.setEmployeeId(9999L);
         vEmp.setSysTenantId(10);
         vEmp.setSysUser(vUser);
-        em.merge(vEmp);
+        vEmp = em.merge(vEmp);
 
         em.flush();
         em.clear();
 
-        List<Object[]> results = em.createQuery("SELECT e.employeeId, u.username FROM HrEmployee e JOIN e.sysUser u WHERE e.employeeId = 9999")
+        List<Object[]> results = em.createQuery("SELECT e.employeeId, u.username FROM HrEmployee e JOIN e.sysUser u WHERE e.employeeId = " + vEmp.getEmployeeId())
                                    .getResultList();
 
         assertEquals(1, results.size());
-        assertEquals(9999L, results.get(0)[0]);
+        assertEquals(vEmp.getEmployeeId(), ((Number) results.get(0)[0]).longValue());
         assertEquals("virtual_user", results.get(0)[1]);
 
         em.getTransaction().rollback();
@@ -210,10 +206,9 @@ public class ComplexQueryTest {
         // Employee 102 exists physically but its User 2 is disabled.
         // Let's create a NEW virtual user and link Employee 102 to it in proxy.
         SysUser vUser = new SysUser();
-        vUser.setUserId(888L);
         vUser.setUsername("new_virtual_user");
         vUser.setEnabled(true);
-        em.merge(vUser);
+        vUser = em.merge(vUser);
 
         HrEmployee e102 = em.find(HrEmployee.class, 102L);
         e102.setSysUser(vUser);
@@ -238,10 +233,9 @@ public class ComplexQueryTest {
         // Physical OrgUsers: 1 (org_user_1), 2 (org_user_2)
         // Insert virtual OrgUser: 1.5 (org_user_1.5)
         OrgUser vUser = new OrgUser();
-        vUser.setUserID(15L);
         vUser.setUserName("org_user_1.5");
         vUser.setOrganizationID(100);
-        em.merge(vUser);
+        vUser = em.merge(vUser);
         em.flush();
 
         // Query with Order By

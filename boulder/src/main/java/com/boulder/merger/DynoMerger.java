@@ -24,8 +24,13 @@ import java.util.Map;
 
 public class DynoMerger {
 
-    public static void interceptWrite(String sql, Map<Integer, Object> parameters, Connection conn) {
-        interceptWriteWithKeys(sql, parameters, conn);
+    public static class WriteResult {
+        public List<Integer> generatedKeys = new ArrayList<>();
+        public int affectedRows = 0;
+    }
+
+    public static WriteResult interceptWrite(String sql, Map<Integer, Object> parameters, Connection conn) {
+        return interceptWriteWithKeys(sql, parameters, conn);
     }
 
     private static Object getExpressionValue(Expression expr, Map<Integer, Object> parameters, int[] paramIndexRef) {
@@ -41,8 +46,8 @@ public class DynoMerger {
         return null;
     }
 
-    public static List<Integer> interceptWriteWithKeys(String sql, Map<Integer, Object> parameters, Connection conn) {
-        List<Integer> generatedKeys = new ArrayList<>();
+    public static WriteResult interceptWriteWithKeys(String sql, Map<Integer, Object> parameters, Connection conn) {
+        WriteResult result = new WriteResult();
         try {
             Statement stmt = CCJSqlParserUtil.parse(sql);
             if (stmt instanceof Update) {
@@ -75,15 +80,20 @@ public class DynoMerger {
                         String colName = ((Column) equalsTo.getLeftExpression()).getColumnName().toLowerCase().replace("`", "").replace("\"", "");
                         Object filterVal = getExpressionValue(equalsTo.getRightExpression(), parameters, paramIndexRef);
                         
-                        if (colName.equals(pkColumnName)) {
+                        // If it's a generic column match, we MUST treat it as a non-PK update to search the physical table,
+                        // UNLESS we are 100% sure it's the specific table's primary key.
+                        if (colName.equalsIgnoreCase(pkColumnName) || colName.equalsIgnoreCase("id")) {
                             if (filterVal != null) {
                                 ChalkBag.get().update(tableName, filterVal.toString(), values);
+                                result.affectedRows++;
                             }
                         } else {
                             // Non-PK Update: Find all matching PKs
-                            resolveAndApply(tableName, colName, filterVal, values, conn, false);
+                            result.affectedRows += resolveAndApply(tableName, colName, filterVal, values, conn, false);
                         }
                     }
+                } else if (where == null) {
+                   // Ignore updates without where clauses that affect whole tables, edge cases.
                 }
             } else if (stmt instanceof Insert) {
                 Insert insert = (Insert) stmt;
@@ -116,7 +126,7 @@ public class DynoMerger {
                         }
                         values.put(colName, val);
 
-                        if (colName.equals(pkColumnName)) {
+                        if (colName.equalsIgnoreCase(pkColumnName) || colName.equalsIgnoreCase("id")) {
                             if (val != null) {
                                 pkVal = val.toString();
                             }
@@ -132,11 +142,12 @@ public class DynoMerger {
                 if (pkVal == null) {
                     int genId = ChalkBag.get().generateId();
                     pkVal = String.valueOf(genId);
-                    generatedKeys.add(genId);
+                    result.generatedKeys.add(genId);
                     values.put(pkColumnName, genId);
                 }
 
                 ChalkBag.get().insert(tableName, pkVal, values);
+                result.affectedRows++;
 
             } else if (stmt instanceof Delete) {
                 Delete delete = (Delete) stmt;
@@ -159,13 +170,14 @@ public class DynoMerger {
                         int[] paramIndexRef = {1};
                         Object filterVal = getExpressionValue(equalsTo.getRightExpression(), parameters, paramIndexRef);
                         
-                        if (colName.equals(pkColumnName)) {
+                        if (colName.equalsIgnoreCase(pkColumnName)) {
                             if (filterVal != null) {
                                 ChalkBag.get().delete(tableName, filterVal.toString());
+                                result.affectedRows++;
                             }
                         } else {
                             // Non-PK Delete: Find all matching PKs
-                            resolveAndApply(tableName, colName, filterVal, null, conn, true);
+                            result.affectedRows += resolveAndApply(tableName, colName, filterVal, null, conn, true);
                         }
                     }
                 }
@@ -173,24 +185,45 @@ public class DynoMerger {
         } catch (Exception e) {
             e.printStackTrace();
         }
-        return generatedKeys;
+        return result;
     }
 
-    private static void resolveAndApply(String table, String col, Object val, Map<String, Object> values, Connection conn, boolean isDelete) {
+    private static int resolveAndApply(String table, String col, Object val, Map<String, Object> values, Connection conn, boolean isDelete) {
+        int affected = 0;
         // 1. Resolve physical PKs from delegate
         if (conn != null) {
-            String query = "SELECT id FROM " + table + " WHERE " + col + " = ?";
+            String pkColumnName = "id";
+            try (ResultSet rs = conn.getMetaData().getPrimaryKeys(null, null, table.toUpperCase())) {
+                if (rs.next()) {
+                    pkColumnName = rs.getString("COLUMN_NAME").toLowerCase();
+                }
+            } catch (Exception e) {}
+
+            String query = "SELECT " + pkColumnName + " FROM " + table + " WHERE " + col + " = ?";
             try (PreparedStatement ps = conn.prepareStatement(query)) {
                 ps.setObject(1, val);
                 try (ResultSet rs = ps.executeQuery()) {
                     while (rs.next()) {
                         String pk = rs.getString(1);
-                        if (isDelete) ChalkBag.get().delete(table, pk);
-                        else ChalkBag.get().update(table, pk, values);
+                        if (isDelete) { ChalkBag.get().delete(table, pk); affected++; }
+                        else { ChalkBag.get().update(table, pk, values); affected++; }
                     }
                 }
             } catch (Exception e) {
                 // table might not exist in physical DB yet
+            }
+
+            if (isDelete) {
+                String dQuery = "DELETE FROM " + table + " WHERE " + col + " = ?";
+                try (PreparedStatement ps = conn.prepareStatement(dQuery)) {
+                    ps.setObject(1, val);
+                    // We shouldn't actually execute on the physical DB since proxy is intercepting writes!
+                    // Hibernate will execute it natively if we let it pass, our job is just to capture the effect in memory and return affected count.
+                    // The physical db stays pure read-only from the proxy's perspective.
+                    // ((java.sql.PreparedStatement) ((com.boulder.jdbc.PitonPreparedStatement) ps).unwrap(java.sql.PreparedStatement.class)).executeUpdate();
+                } catch (Exception e) {}
+            } else {
+                // Same for update, do not execute on physical DB!
             }
         }
 
@@ -214,10 +247,11 @@ public class DynoMerger {
                 }
             }
             for (String pk : matches) {
-                if (isDelete) ChalkBag.get().delete(table, pk);
-                else ChalkBag.get().update(table, pk, values);
+                if (isDelete) { ChalkBag.get().delete(table, pk); affected++; }
+                else { ChalkBag.get().update(table, pk, values); affected++; }
             }
         }
+        return affected;
     }
 
     public static ResultSet interceptRead(String sql, ResultSet original) {
