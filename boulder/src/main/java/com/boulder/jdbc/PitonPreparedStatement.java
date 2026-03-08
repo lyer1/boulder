@@ -50,11 +50,11 @@ public class PitonPreparedStatement extends PitonStatement implements PreparedSt
     @Override
     public int executeUpdate() throws SQLException {
         if (isWriteOperation(sql)) {
-            List<Integer> keys = DynoMerger.interceptWriteWithKeys(sql, parameters, connection);
-            if (keys != null && !keys.isEmpty()) {
-                 this.generatedKeysResultSet = new GeneratedKeysResultSet(keys);
+            DynoMerger.WriteResult result = DynoMerger.interceptWriteWithKeys(sql, parameters, connection);
+            if (result.generatedKeys != null && !result.generatedKeys.isEmpty()) {
+                 this.generatedKeysResultSet = new GeneratedKeysResultSet(result.generatedKeys);
             }
-            return 1;
+            return result.affectedRows;
         }
         if (delegatePreparedStatement == null) return 0;
         return delegatePreparedStatement.executeUpdate();
@@ -198,9 +198,9 @@ public class PitonPreparedStatement extends PitonStatement implements PreparedSt
              return true;
         }
         if (isWriteOperation(sql)) {
-            List<Integer> keys = DynoMerger.interceptWriteWithKeys(sql, parameters, connection);
-            if (keys != null && !keys.isEmpty()) {
-                 this.generatedKeysResultSet = new GeneratedKeysResultSet(keys);
+            DynoMerger.WriteResult result = DynoMerger.interceptWriteWithKeys(sql, parameters, connection);
+            if (result.generatedKeys != null && !result.generatedKeys.isEmpty()) {
+                 this.generatedKeysResultSet = new GeneratedKeysResultSet(result.generatedKeys);
             }
             return false;
         }
@@ -228,11 +228,11 @@ public class PitonPreparedStatement extends PitonStatement implements PreparedSt
         if (isWriteOperation(sql)) {
             int[] results = new int[batchParameters.size()];
             for (int i = 0; i < batchParameters.size(); i++) {
-                List<Integer> keys = DynoMerger.interceptWriteWithKeys(sql, batchParameters.get(i), connection);
-                if (keys != null && !keys.isEmpty()) {
-                     this.generatedKeysResultSet = new GeneratedKeysResultSet(keys);
+                DynoMerger.WriteResult result = DynoMerger.interceptWriteWithKeys(sql, batchParameters.get(i), connection);
+                if (result.generatedKeys != null && !result.generatedKeys.isEmpty()) {
+                     this.generatedKeysResultSet = new GeneratedKeysResultSet(result.generatedKeys);
                 }
-                results[i] = 1;
+                results[i] = result.affectedRows;
             }
             batchParameters.clear();
             return results;
