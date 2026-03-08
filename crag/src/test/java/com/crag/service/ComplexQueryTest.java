@@ -1,14 +1,13 @@
 package com.crag.service;
 
 import com.boulder.state.ChalkBag;
-import com.crag.entity.HrEmployee;
-import com.crag.entity.SysUser;
-import com.crag.entity.OrgUser;
+import com.crag.entity.*;
 import jakarta.persistence.*;
 import org.junit.jupiter.api.*;
 
 import java.sql.Connection;
 import java.sql.DriverManager;
+import java.sql.ResultSet;
 import java.sql.Statement;
 import java.util.List;
 
@@ -24,23 +23,37 @@ public class ComplexQueryTest {
 
         try (Connection conn = DriverManager.getConnection("jdbc:h2:mem:cragdb;DB_CLOSE_DELAY=-1", "sa", "")) {
             try (Statement stmt = conn.createStatement()) {
+                stmt.execute("DROP TABLE IF EXISTS user_address");
                 stmt.execute("DROP TABLE IF EXISTS hr_employee");
                 stmt.execute("DROP TABLE IF EXISTS sys_user");
                 stmt.execute("DROP TABLE IF EXISTS org_user");
+                stmt.execute("DROP TABLE IF EXISTS department");
+                stmt.execute("DROP TABLE IF EXISTS organization");
+                stmt.execute("DROP TABLE IF EXISTS designation");
+                stmt.execute("DROP TABLE IF EXISTS vpf_table");
                 
-                stmt.execute("CREATE TABLE sys_user (userId BIGINT PRIMARY KEY, username VARCHAR(255), enabled BOOLEAN)");
-                stmt.execute("CREATE TABLE hr_employee (employeeId BIGINT PRIMARY KEY, sysTenantId INT, hrOrganizationId INT, designationID INT, user_id BIGINT)");
-                stmt.execute("CREATE TABLE org_user (userID BIGINT PRIMARY KEY, userName VARCHAR(255), organizationID INT)");
+                stmt.execute("CREATE TABLE organization (organizationid BIGINT PRIMARY KEY, name VARCHAR(255))");
+                stmt.execute("CREATE TABLE department (departmentid BIGINT PRIMARY KEY, name VARCHAR(255), org_id BIGINT)");
+                stmt.execute("CREATE TABLE designation (designationid BIGINT PRIMARY KEY, designationname VARCHAR(255))");
+                stmt.execute("CREATE TABLE sys_user (userid BIGINT PRIMARY KEY, username VARCHAR(255), enabled BOOLEAN)");
+                stmt.execute("CREATE TABLE user_address (addressid BIGINT PRIMARY KEY, city VARCHAR(255), state VARCHAR(255), user_id BIGINT)");
+                stmt.execute("CREATE TABLE hr_employee (employeeid BIGINT PRIMARY KEY, systenantid INT, hrorganizationid INT, designation_id BIGINT, dept_id BIGINT, user_id BIGINT)");
+                stmt.execute("CREATE TABLE org_user (userid BIGINT PRIMARY KEY, username VARCHAR(255), organizationid INT)");
+                stmt.execute("CREATE TABLE vpf_table (id INT AUTO_INCREMENT PRIMARY KEY, emp_id INT, percent DOUBLE, status VARCHAR(255))");
                 
-                // Initial data for joins
-                stmt.execute("INSERT INTO sys_user (userId, username, enabled) VALUES (1, 'user1', true)");
-                stmt.execute("INSERT INTO hr_employee (employeeId, sysTenantId, hrOrganizationId, designationID, user_id) VALUES (101, 10, 1, 500, 1)");
-                stmt.execute("INSERT INTO sys_user (userId, username, enabled) VALUES (2, 'user2', false)");
-                stmt.execute("INSERT INTO hr_employee (employeeId, sysTenantId, hrOrganizationId, designationID, user_id) VALUES (102, 10, 1, 500, 2)");
+                // Initial data
+                stmt.execute("INSERT INTO organization (organizationid, name) VALUES (1, 'TechCorp')");
+                stmt.execute("INSERT INTO department (departmentid, name, org_id) VALUES (10, 'Engineering', 1)");
+                stmt.execute("INSERT INTO designation (designationid, designationname) VALUES (500, 'Senior Engineer')");
+                stmt.execute("INSERT INTO sys_user (userid, username, enabled) VALUES (1, 'user1', true)");
+                stmt.execute("INSERT INTO user_address (addressid, city, state, user_id) VALUES (1, 'Bangalore', 'Karnataka', 1)");
+                stmt.execute("INSERT INTO hr_employee (employeeid, systenantid, hrorganizationid, designation_id, dept_id, user_id) VALUES (101, 10, 1, 500, 10, 1)");
 
-                // Initial data for OrgUser
-                stmt.execute("INSERT INTO org_user (userID, userName, organizationID) VALUES (1, 'org_user_1', 100)");
-                stmt.execute("INSERT INTO org_user (userID, userName, organizationID) VALUES (2, 'org_user_2', 100)");
+                stmt.execute("INSERT INTO sys_user (userid, username, enabled) VALUES (2, 'user2', false)");
+                stmt.execute("INSERT INTO hr_employee (employeeid, systenantid, hrorganizationid, designation_id, dept_id, user_id) VALUES (102, 10, 1, 500, 10, 2)");
+
+                stmt.execute("INSERT INTO org_user (userid, username, organizationid) VALUES (1, 'org_user_1', 100)");
+                stmt.execute("INSERT INTO org_user (userid, username, organizationid) VALUES (2, 'org_user_2', 100)");
             }
         }
     }
@@ -55,8 +68,212 @@ public class ComplexQueryTest {
         ChalkBag.clear();
     }
 
+    private void assertPhysicalDatabaseCounts() throws Exception {
+        try (Connection conn = DriverManager.getConnection("jdbc:h2:mem:cragdb;DB_CLOSE_DELAY=-1", "sa", "")) {
+            try (Statement stmt = conn.createStatement()) {
+                ResultSet rs = stmt.executeQuery("SELECT COUNT(*) FROM hr_employee"); rs.next(); assertEquals(2, rs.getInt(1), "Physical DB modified: hr_employee count");
+                rs = stmt.executeQuery("SELECT COUNT(*) FROM sys_user"); rs.next(); assertEquals(2, rs.getInt(1), "Physical DB modified: sys_user count");
+                rs = stmt.executeQuery("SELECT COUNT(*) FROM designation"); rs.next(); assertEquals(1, rs.getInt(1), "Physical DB modified: designation count");
+                rs = stmt.executeQuery("SELECT COUNT(*) FROM department"); rs.next(); assertEquals(1, rs.getInt(1), "Physical DB modified: department count");
+                rs = stmt.executeQuery("SELECT COUNT(*) FROM organization"); rs.next(); assertEquals(1, rs.getInt(1), "Physical DB modified: organization count");
+                rs = stmt.executeQuery("SELECT COUNT(*) FROM user_address"); rs.next(); assertEquals(1, rs.getInt(1), "Physical DB modified: user_address count");
+                rs = stmt.executeQuery("SELECT COUNT(*) FROM org_user"); rs.next(); assertEquals(2, rs.getInt(1), "Physical DB modified: org_user count");
+                rs = stmt.executeQuery("SELECT COUNT(*) FROM vpf_table"); rs.next(); assertEquals(0, rs.getInt(1), "Physical DB modified: vpf_table count");
+            }
+        }
+    }
+
     @Test
-    public void testCountAggregate_WithProxyChanges() {
+    public void testProjectingColumnsFromJoinedTables() throws Exception {
+        EntityManager em = emf.createEntityManager();
+        em.getTransaction().begin();
+
+        // Virtual designation for physical employee
+        Designation vDesig = new Designation();
+        vDesig.setDesignationName("Lead Architect");
+        vDesig = em.merge(vDesig);
+
+        HrEmployee e101 = em.find(HrEmployee.class, 101L);
+        e101.setDesignation(vDesig);
+        em.flush();
+        em.clear();
+
+        // Query projecting columns from both tables
+        String hql = "SELECT e.employeeId, d.designationName FROM HrEmployee e JOIN e.designation d WHERE e.employeeId = 101";
+        List<Object[]> results = em.createQuery(hql).getResultList();
+
+        assertEquals(1, results.size());
+        assertEquals(101L, ((Number) results.get(0)[0]).longValue());
+        assertEquals("Lead Architect", results.get(0)[1]);
+
+        em.getTransaction().rollback();
+        em.close();
+        
+        assertPhysicalDatabaseCounts();
+        try (Connection conn = DriverManager.getConnection("jdbc:h2:mem:cragdb;DB_CLOSE_DELAY=-1", "sa", "");
+             Statement stmt = conn.createStatement()) {
+             ResultSet rs = stmt.executeQuery("SELECT designation_id FROM hr_employee WHERE employeeid = 101");
+             rs.next();
+             assertEquals(500, rs.getInt(1), "Physical DB modified: employee 101 designation should remain 500");
+        }
+    }
+
+    @Test
+    public void testDistinctQuery() throws Exception {
+        EntityManager em = emf.createEntityManager();
+        em.getTransaction().begin();
+
+        // Create 2 virtual employees in same department
+        Department dept = em.find(Department.class, 10L);
+        
+        HrEmployee v1 = new HrEmployee();
+        v1.setSysTenantId(10);
+        v1.setDepartment(dept);
+        em.merge(v1);
+
+        HrEmployee v2 = new HrEmployee();
+        v2.setSysTenantId(10);
+        v2.setDepartment(dept);
+        em.merge(v2);
+
+        em.flush();
+        em.clear();
+
+        // Query for distinct department names from employees
+        String hql = "SELECT DISTINCT d.name FROM HrEmployee e JOIN e.department d WHERE e.sysTenantId = 10";
+        List<String> names = em.createQuery(hql, String.class).getResultList();
+
+        assertEquals(1, names.size());
+        assertEquals("Engineering", names.get(0));
+
+        em.getTransaction().rollback();
+        em.close();
+
+        assertPhysicalDatabaseCounts();
+    }
+
+    @Test
+    public void testMultiLevelJoin_EmployeeToOrganization() throws Exception {
+        EntityManager em = emf.createEntityManager();
+        em.getTransaction().begin();
+
+        // 1. Create a virtual organization, department, and employee in proxy
+        Organization vOrg = new Organization();
+        vOrg.setName("VirtualCorp");
+        vOrg = em.merge(vOrg);
+
+        Department vDept = new Department();
+        vDept.setName("V-Sales");
+        vDept.setOrganization(vOrg);
+        vDept = em.merge(vDept);
+
+        HrEmployee vEmp = new HrEmployee();
+        vEmp.setSysTenantId(10);
+        vEmp.setDepartment(vDept);
+        vEmp = em.merge(vEmp);
+
+        em.flush();
+        em.clear();
+
+        // 2. Query with multiple joins across virtual and physical rows
+        String hql = "SELECT e.employeeId, d.name, o.name FROM HrEmployee e JOIN e.department d JOIN d.organization o WHERE o.name = 'VirtualCorp'";
+        List<Object[]> results = em.createQuery(hql).getResultList();
+
+        assertEquals(1, results.size());
+        assertEquals(vEmp.getEmployeeId(), ((Number) results.get(0)[0]).longValue());
+        assertEquals("V-Sales", results.get(0)[1]);
+        assertEquals("VirtualCorp", results.get(0)[2]);
+
+        // 3. Query with join across physical rows
+        hql = "SELECT e.employeeId, d.name, o.name FROM HrEmployee e JOIN e.department d JOIN d.organization o WHERE o.name = 'TechCorp'";
+        results = em.createQuery(hql).getResultList();
+        assertEquals(2, results.size());
+
+        em.getTransaction().rollback();
+        em.close();
+
+        assertPhysicalDatabaseCounts();
+    }
+
+    @Test
+    public void testNestedJoin_UserAddresses() throws Exception {
+        EntityManager em = emf.createEntityManager();
+        em.getTransaction().begin();
+
+        // Add a virtual address to physical user 1
+        SysUser user1 = em.find(SysUser.class, 1L);
+        UserAddress vAddr = new UserAddress();
+        vAddr.setCity("Mumbai");
+        vAddr.setState("Maharashtra");
+        vAddr.setSysUser(user1);
+        em.merge(vAddr);
+
+        em.flush();
+        em.clear();
+
+        // Query for user by address city (Bangalore - physical, Mumbai - virtual)
+        String hql = "SELECT u.username, a.city FROM SysUser u JOIN u.addresses a WHERE a.city = 'Mumbai'";
+        List<Object[]> results = em.createQuery(hql).getResultList();
+
+        assertEquals(1, results.size());
+        assertEquals("user1", results.get(0)[0]);
+        assertEquals("Mumbai", results.get(0)[1]);
+
+        hql = "SELECT u.username, a.city FROM SysUser u JOIN u.addresses a WHERE a.city = 'Bangalore'";
+        results = em.createQuery(hql).getResultList();
+        assertEquals(1, results.size());
+        assertEquals("user1", results.get(0)[0]);
+        assertEquals("Bangalore", results.get(0)[1]);
+
+        em.getTransaction().rollback();
+        em.close();
+
+        assertPhysicalDatabaseCounts();
+        try (Connection conn = DriverManager.getConnection("jdbc:h2:mem:cragdb;DB_CLOSE_DELAY=-1", "sa", "");
+             Statement stmt = conn.createStatement()) {
+             ResultSet rs = stmt.executeQuery("SELECT city FROM user_address WHERE user_id = 1");
+             rs.next();
+             assertEquals("Bangalore", rs.getString(1), "Physical DB modified: user 1 address should remain Bangalore");
+             assertFalse(rs.next(), "Physical DB modified: user 1 should only have 1 physical address");
+        }
+    }
+
+    @Test
+    public void testJoinFetchWithVirtualRows() throws Exception {
+        EntityManager em = emf.createEntityManager();
+        em.getTransaction().begin();
+
+        // Create virtual designation and assign to employee 101
+        Designation vDesig = new Designation();
+        vDesig.setDesignationName("Lead Architect");
+        vDesig = em.merge(vDesig);
+
+        HrEmployee e101 = em.find(HrEmployee.class, 101L);
+        e101.setDesignation(vDesig);
+        em.flush();
+        em.clear();
+
+        // Join Fetch should work correctly even with virtual entities
+        String hql = "SELECT e FROM HrEmployee e JOIN FETCH e.designation d WHERE e.employeeId = 101";
+        HrEmployee result = em.createQuery(hql, HrEmployee.class).getSingleResult();
+
+        assertNotNull(result.getDesignation());
+        assertEquals("Lead Architect", result.getDesignation().getDesignationName());
+
+        em.getTransaction().rollback();
+        em.close();
+
+        assertPhysicalDatabaseCounts();
+        try (Connection conn = DriverManager.getConnection("jdbc:h2:mem:cragdb;DB_CLOSE_DELAY=-1", "sa", "");
+             Statement stmt = conn.createStatement()) {
+             ResultSet rs = stmt.executeQuery("SELECT designation_id FROM hr_employee WHERE employeeid = 101");
+             rs.next();
+             assertEquals(500, rs.getInt(1), "Physical DB modified: employee 101 designation should remain 500");
+        }
+    }
+
+    @Test
+    public void testCountAggregate_WithProxyChanges() throws Exception {
         EntityManager em = emf.createEntityManager();
         em.getTransaction().begin();
 
@@ -76,10 +293,17 @@ public class ComplexQueryTest {
 
         em.getTransaction().rollback();
         em.close();
+
+        assertPhysicalDatabaseCounts();
+        try (Connection conn = DriverManager.getConnection("jdbc:h2:mem:cragdb;DB_CLOSE_DELAY=-1", "sa", "");
+             Statement stmt = conn.createStatement()) {
+             ResultSet rs = stmt.executeQuery("SELECT employeeid FROM hr_employee WHERE employeeid = 101");
+             assertTrue(rs.next(), "Physical DB modified: removed employee 101 should still exist physically");
+        }
     }
 
     @Test
-    public void testChainedProxyOperations() {
+    public void testChainedProxyOperations() throws Exception {
         EntityManager em = emf.createEntityManager();
         em.getTransaction().begin();
 
@@ -99,10 +323,18 @@ public class ComplexQueryTest {
 
         em.getTransaction().rollback();
         em.close();
+
+        assertPhysicalDatabaseCounts();
+        try (Connection conn = DriverManager.getConnection("jdbc:h2:mem:cragdb;DB_CLOSE_DELAY=-1", "sa", "");
+             Statement stmt = conn.createStatement()) {
+             ResultSet rs = stmt.executeQuery("SELECT COUNT(*) FROM org_user WHERE organizationid = 999");
+             rs.next();
+             assertEquals(0, rs.getInt(1), "Physical DB modified: chained virtual user should not exist physically");
+        }
     }
 
     @Test
-    public void testDeleteByNonPkFilter() {
+    public void testDeleteByNonPkFilter() throws Exception {
         EntityManager em = emf.createEntityManager();
         em.getTransaction().begin();
 
@@ -120,10 +352,18 @@ public class ComplexQueryTest {
 
         em.getTransaction().rollback();
         em.close();
+
+        assertPhysicalDatabaseCounts();
+        try (Connection conn = DriverManager.getConnection("jdbc:h2:mem:cragdb;DB_CLOSE_DELAY=-1", "sa", "");
+             Statement stmt = conn.createStatement()) {
+             ResultSet rs = stmt.executeQuery("SELECT COUNT(*) FROM org_user WHERE organizationid = 100");
+             rs.next();
+             assertEquals(2, rs.getInt(1), "Physical DB modified: physically deleted users should still exist");
+        }
     }
 
     @Test
-    public void testJoinWithBothVirtualRows() {
+    public void testJoinWithBothVirtualRows() throws Exception {
         EntityManager em = emf.createEntityManager();
         em.getTransaction().begin();
 
@@ -149,10 +389,12 @@ public class ComplexQueryTest {
 
         em.getTransaction().rollback();
         em.close();
+
+        assertPhysicalDatabaseCounts();
     }
 
     @Test
-    public void testFilterReevaluation_PatchToExclude() {
+    public void testFilterReevaluation_PatchToExclude() throws Exception {
         EntityManager em = emf.createEntityManager();
         em.getTransaction().begin();
 
@@ -171,10 +413,18 @@ public class ComplexQueryTest {
 
         em.getTransaction().rollback();
         em.close();
+
+        assertPhysicalDatabaseCounts();
+        try (Connection conn = DriverManager.getConnection("jdbc:h2:mem:cragdb;DB_CLOSE_DELAY=-1", "sa", "");
+             Statement stmt = conn.createStatement()) {
+             ResultSet rs = stmt.executeQuery("SELECT systenantid FROM hr_employee WHERE employeeid = 101");
+             rs.next();
+             assertEquals(10, rs.getInt(1), "Physical DB modified: employee 101 tenantId should remain 10 physically");
+        }
     }
 
     @Test
-    public void testFilterReevaluation_PatchToInclude() {
+    public void testFilterReevaluation_PatchToInclude() throws Exception {
         EntityManager em = emf.createEntityManager();
         em.getTransaction().begin();
 
@@ -196,10 +446,18 @@ public class ComplexQueryTest {
 
         em.getTransaction().rollback();
         em.close();
+
+        assertPhysicalDatabaseCounts();
+        try (Connection conn = DriverManager.getConnection("jdbc:h2:mem:cragdb;DB_CLOSE_DELAY=-1", "sa", "");
+             Statement stmt = conn.createStatement()) {
+             ResultSet rs = stmt.executeQuery("SELECT systenantid FROM hr_employee WHERE employeeid = 102");
+             rs.next();
+             assertEquals(10, rs.getInt(1), "Physical DB modified: employee 102 tenantId should remain 10 physically");
+        }
     }
 
     @Test
-    public void testLeftJoin_PhysicalPrimary_VirtualJoined() {
+    public void testLeftJoin_PhysicalPrimary_VirtualJoined() throws Exception {
         EntityManager em = emf.createEntityManager();
         em.getTransaction().begin();
 
@@ -223,10 +481,18 @@ public class ComplexQueryTest {
 
         em.getTransaction().rollback();
         em.close();
+
+        assertPhysicalDatabaseCounts();
+        try (Connection conn = DriverManager.getConnection("jdbc:h2:mem:cragdb;DB_CLOSE_DELAY=-1", "sa", "");
+             Statement stmt = conn.createStatement()) {
+             ResultSet rs = stmt.executeQuery("SELECT user_id FROM hr_employee WHERE employeeid = 102");
+             rs.next();
+             assertEquals(2, rs.getInt(1), "Physical DB modified: employee 102 user_id should remain 2 physically");
+        }
     }
 
     @Test
-    public void testOrderBy_VirtualInterleaving() {
+    public void testOrderBy_VirtualInterleaving() throws Exception {
         EntityManager em = emf.createEntityManager();
         em.getTransaction().begin();
 
@@ -249,5 +515,13 @@ public class ComplexQueryTest {
 
         em.getTransaction().rollback();
         em.close();
+
+        assertPhysicalDatabaseCounts();
+        try (Connection conn = DriverManager.getConnection("jdbc:h2:mem:cragdb;DB_CLOSE_DELAY=-1", "sa", "");
+             Statement stmt = conn.createStatement()) {
+             ResultSet rs = stmt.executeQuery("SELECT COUNT(*) FROM org_user WHERE username = 'org_user_1.5'");
+             rs.next();
+             assertEquals(0, rs.getInt(1), "Physical DB modified: virtual user should not exist physically");
+        }
     }
 }
