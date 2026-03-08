@@ -9,6 +9,9 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import com.boulder.merger.DynoMerger;
+import net.sf.jsqlparser.parser.CCJSqlParserUtil;
+import net.sf.jsqlparser.statement.select.Select;
+import net.sf.jsqlparser.util.TablesNamesFinder;
 
 public class PitonPreparedStatement extends PitonStatement implements PreparedStatement {
 
@@ -42,8 +45,53 @@ public class PitonPreparedStatement extends PitonStatement implements PreparedSt
              return new GeneratedKeysResultSet(keys);
         }
 
+        boolean needsFederation = false;
+        boolean parseFailed = false;
+        java.util.Set<String> queryTables = new java.util.HashSet<>();
+        try {
+            net.sf.jsqlparser.statement.Statement jSqlStmt = CCJSqlParserUtil.parse(sql);
+            if (jSqlStmt instanceof Select) {
+                TablesNamesFinder tablesNamesFinder = new TablesNamesFinder();
+                List<String> tableList = tablesNamesFinder.getTableList((Select) jSqlStmt);
+
+                if (tableList != null) {
+                    for (String tableName : tableList) {
+                        // clean up table name if it has quotes or schema
+                        String cleanTableName = tableName.replaceAll("[\"`\\[\\]]", "").toLowerCase();
+                        int dotIndex = cleanTableName.lastIndexOf('.');
+                        if (dotIndex != -1) {
+                            cleanTableName = cleanTableName.substring(dotIndex + 1);
+                        }
+                        queryTables.add(cleanTableName);
+                        if (com.boulder.state.ChalkBag.get().getTable(cleanTableName) != null) {
+                            needsFederation = true;
+                        }
+                    }
+                }
+            } else {
+                needsFederation = true;
+            }
+        } catch (Exception e) {
+            needsFederation = true;
+            parseFailed = true;
+        }
+
+        if (!needsFederation) {
+            if (delegatePreparedStatement == null) {
+                 return null;
+            }
+            return delegatePreparedStatement.executeQuery();
+        }
+
+        if (parseFailed) {
+            pitonConnection.lazyInitAllTables();
+        } else {
+            for (String t : queryTables) {
+                pitonConnection.lazyInitTable(t);
+            }
+        }
+
         pitonConnection.syncChalkBagToFederatedEngine();
-        pitonConnection.syncViews();
         
         PreparedStatement fedStmt = pitonConnection.getFederatedConnection().prepareStatement(sql);
         for (Map.Entry<Integer, Object> entry : parameters.entrySet()) {
