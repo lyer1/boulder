@@ -1,0 +1,4 @@
+Dirty Read Performance (Federation Enabled): 636 ms
+Clean Read Performance (Bypass Enabled): 373 ms
+Dirty Read Performance (Federation Enabled): 1852 ms
+Clean Read Performance (Bypass Enabled): 573 ms
