@@ -11,7 +11,14 @@ public class HrEmployee {
 
     private Integer sysTenantId;
     private Integer hrOrganizationId;
-    private Integer designationID;
+
+    @ManyToOne
+    @JoinColumn(name = "designation_id")
+    private Designation designation;
+
+    @ManyToOne
+    @JoinColumn(name = "dept_id")
+    private Department department;
 
     @OneToOne(cascade = CascadeType.ALL)
     @JoinColumn(name = "user_id")
@@ -23,11 +30,14 @@ public class HrEmployee {
     public Integer getSysTenantId() { return sysTenantId; }
     public void setSysTenantId(Integer sysTenantId) { this.sysTenantId = sysTenantId; }
 
-    public Integer hrOrganizationId() { return hrOrganizationId; }
+    public Integer getHrOrganizationId() { return hrOrganizationId; }
     public void setHrOrganizationId(Integer hrOrganizationId) { this.hrOrganizationId = hrOrganizationId; }
 
-    public Integer getDesignationID() { return designationID; }
-    public void setDesignationID(Integer designationID) { this.designationID = designationID; }
+    public Designation getDesignation() { return designation; }
+    public void setDesignation(Designation designation) { this.designation = designation; }
+
+    public Department getDepartment() { return department; }
+    public void setDepartment(Department department) { this.department = department; }
 
     public SysUser getSysUser() { return sysUser; }
     public void setSysUser(SysUser sysUser) { this.sysUser = sysUser; }

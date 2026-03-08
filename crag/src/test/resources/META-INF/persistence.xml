@@ -9,6 +9,10 @@
         <class>com.crag.entity.HrEmployee</class>
         <class>com.crag.entity.SysUser</class>
         <class>com.crag.entity.OrgUser</class>
+        <class>com.crag.entity.Organization</class>
+        <class>com.crag.entity.Department</class>
+        <class>com.crag.entity.UserAddress</class>
+        <class>com.crag.entity.Designation</class>
 
         <properties>
             <property name="jakarta.persistence.jdbc.driver" value="com.boulder.jdbc.PitonDriver"/>
