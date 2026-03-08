@@ -524,4 +524,59 @@ public class ComplexQueryTest {
              assertEquals(0, rs.getInt(1), "Physical DB modified: virtual user should not exist physically");
         }
     }
+
+    @Test
+    @Disabled("This is the 'Impossible Test'. It will fail until the Federated Embedded SQL Engine is implemented.")
+    public void testGroupByWithVirtualData() throws Exception {
+        EntityManager em = emf.createEntityManager();
+        em.getTransaction().begin();
+
+        // Setup: We physically have Employee 101 and 102 in Dept 10.
+        // We will virtually delete 102 from Dept 10.
+        HrEmployee e102 = em.find(HrEmployee.class, 102L);
+        em.remove(e102);
+
+        // We will virtually insert a new employee into a new Dept 20.
+        Department vDept20 = new Department();
+        vDept20.setName("Virtual HR");
+        vDept20 = em.merge(vDept20);
+
+        HrEmployee vEmpNew = new HrEmployee();
+        vEmpNew.setDepartment(vDept20);
+        vEmpNew.setSysTenantId(10);
+        vEmpNew = em.merge(vEmpNew);
+
+        em.flush();
+        em.clear();
+
+        // The query: Group by department, expecting Dept 10 = 1 (101 remains), Dept 20 = 1 (vEmpNew added)
+        String hql = "SELECT e.department.departmentId, COUNT(e.employeeId) FROM HrEmployee e GROUP BY e.department.departmentId";
+        List<Object[]> results = em.createQuery(hql).getResultList();
+
+        assertEquals(2, results.size(), "Should have exactly 2 groups returned");
+        
+        boolean foundDept10 = false;
+        boolean foundDept20 = false;
+
+        for (Object[] row : results) {
+            Long deptId = ((Number) row[0]).longValue();
+            Long count = ((Number) row[1]).longValue();
+
+            if (deptId.equals(10L)) {
+                foundDept10 = true;
+                assertEquals(1L, count, "Dept 10 should have 1 employee left after virtual delete");
+            } else if (deptId.equals(vDept20.getDepartmentId())) {
+                foundDept20 = true;
+                assertEquals(1L, count, "Virtual Dept 20 should have 1 virtual employee");
+            }
+        }
+
+        assertTrue(foundDept10, "Dept 10 group is missing");
+        assertTrue(foundDept20, "Virtual Dept 20 group is missing");
+
+        em.getTransaction().rollback();
+        em.close();
+        
+        assertPhysicalDatabaseCounts();
+    }
 }
