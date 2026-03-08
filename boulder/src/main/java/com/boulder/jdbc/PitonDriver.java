@@ -30,7 +30,7 @@ public class PitonDriver implements Driver {
         String realUrl = url.substring(PREFIX.length());
         Connection realConnection = DriverManager.getConnection(realUrl, info);
 
-        return new PitonConnection(realConnection);
+        return new PitonConnection(realConnection, realUrl, info);
     }
 
     @Override
