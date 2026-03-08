@@ -253,7 +253,7 @@ public class PitonConnection implements Connection {
 
     @Override
     public Statement createStatement() throws SQLException {
-        return new PitonStatement(delegate.createStatement());
+        return new PitonStatement(delegate.createStatement(), this);
     }
 
     @Override
@@ -352,7 +352,7 @@ public class PitonConnection implements Connection {
 
     @Override
     public Statement createStatement(int resultSetType, int resultSetConcurrency) throws SQLException {
-        return new PitonStatement(delegate.createStatement(resultSetType, resultSetConcurrency));
+        return new PitonStatement(delegate.createStatement(resultSetType, resultSetConcurrency), this);
     }
 
     @Override
@@ -408,7 +408,7 @@ public class PitonConnection implements Connection {
 
     @Override
     public Statement createStatement(int resultSetType, int resultSetConcurrency, int resultSetHoldability) throws SQLException {
-        return new PitonStatement(delegate.createStatement(resultSetType, resultSetConcurrency, resultSetHoldability));
+        return new PitonStatement(delegate.createStatement(resultSetType, resultSetConcurrency, resultSetHoldability), this);
     }
 
     @Override

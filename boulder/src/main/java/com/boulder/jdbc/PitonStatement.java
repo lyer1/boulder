@@ -11,10 +11,12 @@ import java.util.ArrayList;
 public class PitonStatement implements Statement {
 
     protected final Statement delegate;
+    protected final PitonConnection pitonConnection;
     protected ResultSet generatedKeysResultSet = null;
 
-    public PitonStatement(Statement delegate) {
+    public PitonStatement(Statement delegate, PitonConnection pitonConnection) {
         this.delegate = delegate;
+        this.pitonConnection = pitonConnection;
     }
 
     private boolean isWriteOperation(String sql) {
@@ -25,8 +27,11 @@ public class PitonStatement implements Statement {
 
     @Override
     public ResultSet executeQuery(String sql) throws SQLException {
-        ResultSet rs = delegate.executeQuery(sql);
-        return new PitonResultSet(rs, sql);
+        pitonConnection.syncChalkBagToFederatedEngine();
+        pitonConnection.syncViews();
+        Statement fedStmt = pitonConnection.getFederatedConnection().createStatement();
+        ResultSet rs = fedStmt.executeQuery(sql);
+        return new PitonResultSet(rs, sql); // Kept PitonResultSet wrapper just in case
     }
 
     @Override

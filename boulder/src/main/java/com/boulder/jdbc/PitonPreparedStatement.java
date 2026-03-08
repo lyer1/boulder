@@ -20,11 +20,11 @@ public class PitonPreparedStatement extends PitonStatement implements PreparedSt
 
     private ResultSet generatedKeysResultSet = null;
 
-    public PitonPreparedStatement(PreparedStatement delegate, String sql, Connection connection) {
-        super(delegate);
+    public PitonPreparedStatement(PreparedStatement delegate, String sql, PitonConnection pitonConnection) {
+        super(delegate, pitonConnection);
         this.delegatePreparedStatement = delegate;
         this.sql = sql;
-        this.connection = connection;
+        this.connection = pitonConnection;
     }
 
     private boolean isWriteOperation(String sql) {
@@ -42,8 +42,15 @@ public class PitonPreparedStatement extends PitonStatement implements PreparedSt
              return new GeneratedKeysResultSet(keys);
         }
 
-        if (delegatePreparedStatement == null) throw new SQLException("Proxy-only statement cannot execute physical query: " + sql);
-        ResultSet rs = delegatePreparedStatement.executeQuery();
+        pitonConnection.syncChalkBagToFederatedEngine();
+        pitonConnection.syncViews();
+        
+        PreparedStatement fedStmt = pitonConnection.getFederatedConnection().prepareStatement(sql);
+        for (Map.Entry<Integer, Object> entry : parameters.entrySet()) {
+            fedStmt.setObject(entry.getKey(), entry.getValue());
+        }
+        
+        ResultSet rs = fedStmt.executeQuery();
         return new PitonResultSet(rs, sql, new HashMap<>(parameters));
     }
 

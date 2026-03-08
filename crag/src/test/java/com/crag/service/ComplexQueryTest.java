@@ -526,7 +526,6 @@ public class ComplexQueryTest {
     }
 
     @Test
-    @Disabled("This is the 'Impossible Test'. It will fail until the Federated Embedded SQL Engine is implemented.")
     public void testGroupByWithVirtualData() throws Exception {
         EntityManager em = emf.createEntityManager();
         em.getTransaction().begin();
@@ -578,5 +577,106 @@ public class ComplexQueryTest {
         em.close();
         
         assertPhysicalDatabaseCounts();
+    }
+
+    @Test
+    public void testComplexFederatedQuery_WithFunctionsJoinsAndMixedState() throws Exception {
+        EntityManager em = emf.createEntityManager();
+        em.getTransaction().begin();
+
+        // 1. Create Pure Virtual Entities
+        Organization vOrg = new Organization();
+        vOrg.setName("AcmeCorp");
+        vOrg = em.merge(vOrg);
+
+        Department vDept = new Department();
+        vDept.setName("Sales");
+        vDept.setOrganization(vOrg);
+        vDept = em.merge(vDept);
+
+        Designation vDesig = new Designation();
+        vDesig.setDesignationName("Manager");
+        vDesig = em.merge(vDesig);
+
+        SysUser vUser = new SysUser();
+        vUser.setUsername("v_user");
+        vUser.setEnabled(true);
+        vUser = em.merge(vUser);
+
+        HrEmployee vEmp = new HrEmployee();
+        vEmp.setSysTenantId(50);
+        vEmp.setDepartment(vDept);
+        vEmp.setDesignation(vDesig);
+        vEmp.setSysUser(vUser);
+        vEmp = em.merge(vEmp);
+
+        // 2. Patch an existing Physical Entity (Mixed State)
+        HrEmployee e101 = em.find(HrEmployee.class, 101L);
+        e101.setDesignation(vDesig); // Virtual relation on physical row
+        e101.setSysTenantId(20);     // Scalar patch on physical row
+        em.flush();
+        em.clear();
+
+        // 3. The Complex Query
+        // - Uses SQL string functions: CONCAT, LOWER
+        // - Joins 5 tables: HrEmployee -> Department -> Organization, HrEmployee -> Designation, HrEmployee -> SysUser
+        // - Filters on patched value and physical value
+        // - Orders by patched/physical values
+        String hql = "SELECT e.employeeId, " +
+                     "CONCAT(LOWER(d.name), '_', LOWER(o.name)), " +
+                     "desig.designationName, " +
+                     "u.username, " +
+                     "e.sysTenantId " +
+                     "FROM HrEmployee e " +
+                     "JOIN e.department d " +
+                     "JOIN d.organization o " +
+                     "JOIN e.designation desig " +
+                     "JOIN e.sysUser u " +
+                     "WHERE e.sysTenantId >= 10 " +
+                     "ORDER BY e.sysTenantId DESC, e.employeeId DESC";
+
+        List<Object[]> results = em.createQuery(hql).getResultList();
+
+        // We expect 3 rows:
+        // 1. vEmp (tenant 50)
+        // 2. e101 (tenant 20 - patched)
+        // 3. e102 (tenant 10 - pure physical)
+        assertEquals(3, results.size(), "Should return exactly 3 rows combining physical, patched, and virtual data");
+
+        // Assert Virtual Employee
+        Object[] row1 = results.get(0);
+        assertEquals(vEmp.getEmployeeId(), ((Number) row1[0]).longValue());
+        assertEquals("sales_acmecorp", row1[1], "SQL Functions should evaluate perfectly on pure virtual rows");
+        assertEquals("Manager", row1[2]);
+        assertEquals("v_user", row1[3]);
+        assertEquals(50, ((Number) row1[4]).intValue());
+
+        // Assert Patched Physical Employee (e101)
+        Object[] row2 = results.get(1);
+        assertEquals(101L, ((Number) row2[0]).longValue());
+        assertEquals("engineering_techcorp", row2[1], "SQL Functions should evaluate perfectly on physical row components");
+        assertEquals("Manager", row2[2], "Virtual join patch should reflect in result");
+        assertEquals("user1", row2[3]);
+        assertEquals(20, ((Number) row2[4]).intValue(), "Scalar patch should reflect in projection and ordering");
+
+        // Assert Pure Physical Employee (e102)
+        Object[] row3 = results.get(2);
+        assertEquals(102L, ((Number) row3[0]).longValue());
+        assertEquals("engineering_techcorp", row3[1]);
+        assertEquals("Senior Engineer", row3[2]);
+        assertEquals("user2", row3[3]);
+        assertEquals(10, ((Number) row3[4]).intValue());
+
+        em.getTransaction().rollback();
+        em.close();
+        
+        assertPhysicalDatabaseCounts();
+        try (Connection conn = DriverManager.getConnection("jdbc:h2:mem:cragdb;DB_CLOSE_DELAY=-1", "sa", "");
+             Statement stmt = conn.createStatement()) {
+             ResultSet rs = stmt.executeQuery("SELECT designation_id, systenantid FROM hr_employee WHERE employeeid = 101");
+             rs.next();
+             assertEquals(500, rs.getInt(1), "Physical DB modified: employee 101 designation should remain 500");
+             assertEquals(10, rs.getInt(2), "Physical DB modified: employee 101 tenant should remain 10");
+        }
     }
 }
