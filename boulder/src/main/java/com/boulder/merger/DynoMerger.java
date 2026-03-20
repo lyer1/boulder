@@ -49,6 +49,15 @@ public class DynoMerger {
                 Update update = (Update) stmt;
                 String tableName = update.getTable().getName().replace("`", "").replace("\"", "");
 
+                String pkColumnName = "id";
+                if (conn != null) {
+                    try (ResultSet rs = conn.getMetaData().getPrimaryKeys(null, null, tableName.toUpperCase())) {
+                        if (rs.next()) {
+                            pkColumnName = rs.getString("COLUMN_NAME").toLowerCase();
+                        }
+                    } catch (Exception e) {}
+                }
+
                 Map<String, Object> values = new HashMap<>();
                 int[] paramIndexRef = {1};
 
@@ -66,7 +75,7 @@ public class DynoMerger {
                         String colName = ((Column) equalsTo.getLeftExpression()).getColumnName().toLowerCase().replace("`", "").replace("\"", "");
                         Object filterVal = getExpressionValue(equalsTo.getRightExpression(), parameters, paramIndexRef);
                         
-                        if (colName.equals("id")) {
+                        if (colName.equals(pkColumnName)) {
                             if (filterVal != null) {
                                 ChalkBag.get().update(tableName, filterVal.toString(), values);
                             }
@@ -79,6 +88,15 @@ public class DynoMerger {
             } else if (stmt instanceof Insert) {
                 Insert insert = (Insert) stmt;
                 String tableName = insert.getTable().getName().replace("`", "").replace("\"", "");
+
+                String pkColumnName = "id";
+                if (conn != null) {
+                    try (ResultSet rs = conn.getMetaData().getPrimaryKeys(null, null, tableName.toUpperCase())) {
+                        if (rs.next()) {
+                            pkColumnName = rs.getString("COLUMN_NAME").toLowerCase();
+                        }
+                    } catch (Exception e) {}
+                }
 
                 Map<String, Object> values = new HashMap<>();
                 int[] paramIndexRef = {1};
@@ -98,8 +116,13 @@ public class DynoMerger {
                         }
                         values.put(colName, val);
 
-                        if (colName.equals("id")) {
+                        if (colName.equals(pkColumnName)) {
                             if (val != null) {
+                                pkVal = val.toString();
+                            }
+                        } else if (colName.endsWith("id") || colName.endsWith("_id")) {
+                            // If it wasn't the actual PK, see if it ends with id. This allows matching userId instead of id.
+                            if (val != null && pkVal == null) {
                                 pkVal = val.toString();
                             }
                         }
@@ -110,7 +133,7 @@ public class DynoMerger {
                     int genId = ChalkBag.get().generateId();
                     pkVal = String.valueOf(genId);
                     generatedKeys.add(genId);
-                    values.put("id", genId); 
+                    values.put(pkColumnName, genId);
                 }
 
                 ChalkBag.get().insert(tableName, pkVal, values);
@@ -118,6 +141,15 @@ public class DynoMerger {
             } else if (stmt instanceof Delete) {
                 Delete delete = (Delete) stmt;
                 String tableName = delete.getTable().getName().replace("`", "").replace("\"", "");
+
+                String pkColumnName = "id";
+                if (conn != null) {
+                    try (ResultSet rs = conn.getMetaData().getPrimaryKeys(null, null, tableName.toUpperCase())) {
+                        if (rs.next()) {
+                            pkColumnName = rs.getString("COLUMN_NAME").toLowerCase();
+                        }
+                    } catch (Exception e) {}
+                }
 
                 Expression where = delete.getWhere();
                 if (where instanceof EqualsTo) {
@@ -127,7 +159,7 @@ public class DynoMerger {
                         int[] paramIndexRef = {1};
                         Object filterVal = getExpressionValue(equalsTo.getRightExpression(), parameters, paramIndexRef);
                         
-                        if (colName.equals("id")) {
+                        if (colName.equals(pkColumnName)) {
                             if (filterVal != null) {
                                 ChalkBag.get().delete(tableName, filterVal.toString());
                             }
