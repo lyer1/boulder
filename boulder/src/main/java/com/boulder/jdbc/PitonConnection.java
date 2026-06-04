@@ -1,6 +1,7 @@
 package com.boulder.jdbc;
 
 import java.sql.*;
+import java.util.List;
 import java.util.Map;
 import java.util.Properties;
 import java.util.concurrent.Executor;
@@ -8,9 +9,240 @@ import java.util.concurrent.Executor;
 public class PitonConnection implements Connection {
 
     private final Connection delegate;
+    private final Connection federatedConnection;
 
-    public PitonConnection(Connection delegate) {
+    public PitonConnection(Connection delegate, String realUrl, Properties info) throws SQLException {
         this.delegate = delegate;
+
+        // Initialize the Federated Engine (H2 in-memory)
+        this.federatedConnection = DriverManager.getConnection("jdbc:h2:mem:federated_engine_" + System.nanoTime() + ";DB_CLOSE_DELAY=-1");
+
+        // Sync schema and create Linked Tables
+        initLinkedTables(realUrl, info);
+    }
+
+    private void initLinkedTables(String realUrl, Properties info) throws SQLException {
+        try (Statement fedStmt = federatedConnection.createStatement()) {
+            DatabaseMetaData metaData = delegate.getMetaData();
+            try (ResultSet tables = metaData.getTables(null, null, "%", new String[] {"TABLE"})) {
+                while (tables.next()) {
+                    String tableName = tables.getString("TABLE_NAME");
+                    // We only want to map user tables, might have to filter
+                    if (tableName.toUpperCase().startsWith("SYSTEM_") || tableName.toUpperCase().startsWith("TRACE_") || tables.getString("TABLE_SCHEM").equalsIgnoreCase("INFORMATION_SCHEMA")) {
+                        continue;
+                    }
+
+                    String user = info != null && info.getProperty("user") != null ? info.getProperty("user") : "sa";
+                    String password = info != null && info.getProperty("password") != null ? info.getProperty("password") : "";
+
+                    String createLinkedTableSql = String.format(
+                            "CREATE LINKED TABLE IF NOT EXISTS phys_%s ('', '%s', '%s', '%s', '(%s)')",
+                            tableName.toLowerCase(), realUrl, user, password, "SELECT * FROM " + tableName
+                    );
+
+                    try {
+                        fedStmt.execute(createLinkedTableSql);
+                    } catch (SQLException e) {
+                        try {
+                            String createLinkedTableSqlFallback = String.format(
+                                    "CREATE LINKED TABLE IF NOT EXISTS phys_%s ('', '%s', '%s', '%s', '%s')",
+                                    tableName.toLowerCase(), realUrl, user, password, tableName
+                            );
+                            fedStmt.execute(createLinkedTableSqlFallback);
+                        } catch (SQLException e2) {
+                             e2.printStackTrace();
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    public Connection getFederatedConnection() {
+        return federatedConnection;
+    }
+
+    public Connection getPhysicalConnection() {
+        return delegate;
+    }
+
+    public void syncChalkBagToFederatedEngine() throws SQLException {
+        try { initLinkedTables(delegate.getMetaData().getURL(), new Properties()); } catch (Exception e) {}
+
+        com.boulder.state.ChalkBag bag = com.boulder.state.ChalkBag.get();
+        Map<String, Map<String, Map<String, Object>>> state = bag.getAllState();
+
+        try (Statement fedStmt = federatedConnection.createStatement()) {
+            DatabaseMetaData metaData = delegate.getMetaData();
+            try (ResultSet tables = metaData.getTables(null, null, "%", new String[] {"TABLE"})) {
+                while (tables.next()) {
+                    String tableName = tables.getString("TABLE_NAME").toLowerCase();
+                    if (tableName.startsWith("system_") || tableName.startsWith("trace_") || tables.getString("TABLE_SCHEM").equalsIgnoreCase("INFORMATION_SCHEMA")) {
+                        continue;
+                    }
+
+                    // Drop views explicitly first to release dependencies
+                    try { fedStmt.execute("DROP VIEW IF EXISTS " + tableName); } catch (Exception e) {}
+
+                    try { fedStmt.execute("DROP TABLE IF EXISTS virt_ins_" + tableName + " CASCADE"); } catch (Exception e) {}
+                    try { fedStmt.execute("DROP TABLE IF EXISTS virt_upd_" + tableName + " CASCADE"); } catch (Exception e) {}
+                    try { fedStmt.execute("DROP TABLE IF EXISTS virt_del_" + tableName + " CASCADE"); } catch (Exception e) {}
+
+                    try { fedStmt.execute("CREATE LOCAL TEMPORARY TABLE virt_ins_" + tableName + " AS SELECT * FROM phys_" + tableName + " WHERE 1=0"); } catch (Exception e) { try { fedStmt.execute("TRUNCATE TABLE virt_ins_" + tableName); } catch (Exception e2) {} }
+                    try { fedStmt.execute("CREATE LOCAL TEMPORARY TABLE virt_upd_" + tableName + " AS SELECT * FROM phys_" + tableName + " WHERE 1=0"); } catch (Exception e) { try { fedStmt.execute("TRUNCATE TABLE virt_upd_" + tableName); } catch (Exception e2) {} }
+                    try { fedStmt.execute("CREATE LOCAL TEMPORARY TABLE virt_del_" + tableName + " (id VARCHAR(255))"); } catch (Exception e) { try { fedStmt.execute("TRUNCATE TABLE virt_del_" + tableName); } catch (Exception e2) {} }
+
+                    Map<String, Map<String, Object>> tableState = state.get(tableName);
+                    if (tableState == null) continue;
+
+                    String pkColumnName = "id";
+                    try (ResultSet rs = metaData.getPrimaryKeys(null, null, tableName.toUpperCase())) {
+                        if (rs.next()) {
+                            pkColumnName = rs.getString("COLUMN_NAME").toLowerCase();
+                        }
+                    } catch (Exception e) {}
+
+                    // Find all PKs in the physical database to avoid N+1 queries
+                    java.util.Set<String> existingPks = new java.util.HashSet<>();
+                    try (PreparedStatement ps = delegate.prepareStatement("SELECT " + pkColumnName + " FROM " + tableName);
+                         ResultSet rs = ps.executeQuery()) {
+                        while (rs.next()) {
+                            existingPks.add(rs.getString(1));
+                        }
+                    } catch (Exception e) {
+
+                    }
+
+                    for (Map.Entry<String, Map<String, Object>> entry : tableState.entrySet()) {
+                        String pk = entry.getKey();
+                        Map<String, Object> values = entry.getValue();
+
+                        if (values == null) {
+                            try (PreparedStatement ps = federatedConnection.prepareStatement("INSERT INTO virt_del_" + tableName + " (id) VALUES (?)")) {
+                                ps.setObject(1, pk);
+                                ps.executeUpdate();
+                            } catch (SQLException e) {
+
+                            }
+                        } else {
+                            boolean existsInPhys = existingPks.contains(pk);
+
+                            String tempTable = existsInPhys ? "virt_upd_" : "virt_ins_";
+
+                            StringBuilder cols = new StringBuilder(pkColumnName);
+                            StringBuilder vals = new StringBuilder("?");
+                            List<Object> paramValues = new java.util.ArrayList<>();
+                            paramValues.add(pk);
+
+                            for (Map.Entry<String, Object> valEntry : values.entrySet()) {
+                                String colName = valEntry.getKey();
+                                if (!colName.equalsIgnoreCase(pkColumnName)) {
+                                    cols.append(", ").append(colName);
+                                    vals.append(", ?");
+                                    paramValues.add(valEntry.getValue());
+                                }
+                            }
+
+                            String sql = "INSERT INTO " + tempTable + tableName + " (" + cols.toString() + ") VALUES (" + vals.toString() + ")";
+                            try (PreparedStatement ps = federatedConnection.prepareStatement(sql)) {
+                                for (int i = 0; i < paramValues.size(); i++) {
+                                    ps.setObject(i + 1, paramValues.get(i));
+                                }
+                                ps.executeUpdate();
+                            } catch (SQLException e) {
+
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    public void syncViews() throws SQLException {
+        try (Statement fedStmt = federatedConnection.createStatement()) {
+            DatabaseMetaData metaData = delegate.getMetaData();
+            try (ResultSet tables = metaData.getTables(null, null, "%", new String[] {"TABLE"})) {
+                while (tables.next()) {
+                    String tableName = tables.getString("TABLE_NAME").toLowerCase();
+                    if (tableName.startsWith("system_") || tableName.startsWith("trace_") || tables.getString("TABLE_SCHEM").equalsIgnoreCase("INFORMATION_SCHEMA")) {
+                        continue;
+                    }
+
+                    String pkColumnName = "id";
+                    try (ResultSet rs = metaData.getPrimaryKeys(null, null, tableName.toUpperCase())) {
+                        if (rs.next()) {
+                            pkColumnName = rs.getString("COLUMN_NAME").toLowerCase();
+                        }
+                    } catch (Exception e) {}
+
+                    StringBuilder selectCols = new StringBuilder();
+                    StringBuilder selectInsCols = new StringBuilder();
+                    try (ResultSet cols = metaData.getColumns(null, null, tableName.toUpperCase(), "%")) {
+                        boolean first = true;
+                        while (cols.next()) {
+                            String colName = cols.getString("COLUMN_NAME").toLowerCase();
+                            if (!first) {
+                                selectCols.append(", ");
+                                selectInsCols.append(", ");
+                            }
+                            first = false;
+
+                            if (colName.equals(pkColumnName)) {
+                                selectCols.append("p.").append(colName);
+                                selectInsCols.append(colName);
+                            } else {
+                                selectCols.append("COALESCE(u.").append(colName).append(", p.").append(colName).append(") AS ").append(colName);
+                                selectInsCols.append(colName);
+                            }
+                        }
+                    }
+
+                    if (selectCols.length() == 0) {
+                        selectCols.append("p.*");
+                        selectInsCols.append("*");
+                    }
+
+                    String viewSql1 = "CREATE OR REPLACE VIEW " + tableName + " AS " +
+                                     "SELECT " + selectCols.toString() + " FROM phys_" + tableName + " p " +
+                                     "LEFT JOIN virt_upd_" + tableName + " u ON p." + pkColumnName + " = u." + pkColumnName + " " +
+                                     "WHERE p." + pkColumnName + " NOT IN (SELECT id FROM virt_del_" + tableName + ") " +
+                                     "UNION ALL " +
+                                     "SELECT " + selectInsCols.toString() + " FROM virt_ins_" + tableName;
+
+                    String viewSql2 = "CREATE OR REPLACE VIEW " + tableName + " AS " +
+                                     "SELECT " + selectCols.toString() + " FROM phys_" + tableName + " p " +
+                                     "LEFT JOIN virt_upd_" + tableName + " u ON p." + pkColumnName + " = u." + pkColumnName + " " +
+                                     "WHERE CAST(p." + pkColumnName + " AS VARCHAR(255)) NOT IN (SELECT CAST(id AS VARCHAR(255)) FROM virt_del_" + tableName + ") " +
+                                     "UNION ALL " +
+                                     "SELECT " + selectInsCols.toString() + " FROM virt_ins_" + tableName;
+
+                    String viewSql3 = "CREATE OR REPLACE VIEW " + tableName + " AS " +
+                                     "SELECT " + selectCols.toString() + " FROM phys_" + tableName + " p " +
+                                     "LEFT JOIN virt_upd_" + tableName + " u ON p." + pkColumnName + " = u." + pkColumnName + " " +
+                                     "WHERE CAST(p." + pkColumnName + " AS VARCHAR(255)) NOT IN (SELECT CAST(id AS VARCHAR(255)) FROM virt_del_" + tableName + ")";
+
+                    String viewSql4 = "CREATE OR REPLACE VIEW " + tableName + " AS SELECT * FROM phys_" + tableName;
+
+                    try {
+                        fedStmt.execute(viewSql1);
+                    } catch (Exception e1) {
+                        try {
+                            fedStmt.execute(viewSql2);
+                        } catch (Exception e2) {
+                            try {
+                                fedStmt.execute(viewSql3);
+                            } catch (Exception e3) {
+                                try {
+                                    fedStmt.execute(viewSql4);
+                                } catch (Exception e4) {
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 
     private boolean isProxyOperation(String sql) {
@@ -62,6 +294,9 @@ public class PitonConnection implements Connection {
 
     @Override
     public void close() throws SQLException {
+        if (federatedConnection != null && !federatedConnection.isClosed()) {
+            federatedConnection.close();
+        }
         delegate.close();
     }
 

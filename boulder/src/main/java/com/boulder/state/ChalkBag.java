@@ -94,4 +94,8 @@ public class ChalkBag {
     public Map<String, Map<String, Object>> getTable(String table) {
         return state.get(table.toLowerCase());
     }
+
+    public Map<String, Map<String, Map<String, Object>>> getAllState() {
+        return state;
+    }
 }
